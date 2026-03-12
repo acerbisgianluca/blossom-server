@@ -12,6 +12,7 @@
  * @property {number} fileSize - Original plaintext file size
  * @property {string} mimeType - MIME type of original file
  * @property {string} encryptedSize - Size of encrypted blob
+ * @property {string} wrappedFDK - Base64 AES-GCM wrapped FDK (encrypted with current FAK)
  * @property {string} folderId - Optional folder reference
  * @property {string} ownerPubkey - Nostr pubkey of uploader
  * @property {number} uploadedAt - Unix timestamp
@@ -20,8 +21,8 @@
 /**
  * @typedef {Object} ShareEventPayload
  * @property {string} blobHash - SHA256 of encrypted blob
- * @property {string} recipientPubkey - Nostr pubkey of recipient
- * @property {string} encryptedFileKey - NIP-44 encrypted file key
+ * @property {string[]} recipients - Nostr pubkeys allowlisted for access
+ * @property {Array<{pubkey: string, encryptedFAK: string}>} accessKeys - NIP-44 encrypted FAK per recipient
  * @property {string} senderPubkey - Nostr pubkey of sender
  * @property {number} sharedAt - Unix timestamp
  */

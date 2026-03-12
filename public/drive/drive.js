@@ -4,23 +4,111 @@
  */
 
 import {
+  generateKey,
   encryptFile,
   decryptFile,
-  keyToHex,
   hexToKey,
+  keyToHex,
+  wrapKey,
+  unwrapKey,
+  rotateAccessKey as rotateWrappedAccessKey,
 } from "./encryption.js";
 import { uploadBlob, downloadBlob } from "./blossom.js";
+import { getBlossomUrl } from "./config.js";
+import { newExpirationValue, unixNow } from "../utils.js";
 import {
   publishFolderEvent,
   publishFileMetadata,
   publishShareEvent,
   fetchFilesForUser,
   fetchSharesForUser,
+  fetchLatestShareEvent,
   fetchFolder,
-  fetchFileMetadataByHash,
+  fetchLatestMetadata,
+  getTagValue,
+  getAllTagValues,
+  getAccessKeyForRecipient,
   encryptNIP44,
   decryptNIP44,
 } from "./nostr.js";
+
+function uniquePubkeys(pubkeys = []) {
+  const clean = pubkeys.map((p) => p?.trim()).filter(Boolean);
+  return [...new Set(clean)];
+}
+
+function base64UrlEncode(data) {
+  return btoa(data).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function getListAuthHeader(pubkey) {
+  const auth = await window.nostr.signEvent({
+    kind: 24242,
+    content: "Authorize List",
+    created_at: unixNow(),
+    tags: [
+      ["t", "list"],
+      ["expiration", newExpirationValue()],
+      ["pubkey", pubkey],
+    ],
+  });
+  return `Nostr ${base64UrlEncode(JSON.stringify(auth))}`;
+}
+
+async function buildRecipientAccessEntries(fak, recipients) {
+  const entries = [];
+  for (const recipient of recipients) {
+    const encryptedFAK = await encryptNIP44(keyToHex(fak), recipient);
+    entries.push({ pubkey: recipient, encryptedFAK });
+  }
+  return entries;
+}
+
+function extractMetadataPayload(metadataEvent) {
+  return {
+    blobHash: getTagValue(metadataEvent, "x"),
+    blobUrl: getTagValue(metadataEvent, "url"),
+    mimeType: getTagValue(metadataEvent, "m") || "application/octet-stream",
+    fileSize: Number.parseInt(getTagValue(metadataEvent, "size") || "0", 10),
+    fileName: getTagValue(metadataEvent, "name") || undefined,
+    folderId: getTagValue(metadataEvent, "folder") || undefined,
+  };
+}
+
+async function resolveCurrentKeyMaterial(blobHash) {
+  const myPubkey = await window.nostr.getPublicKey();
+  const metadataEvent = await fetchLatestMetadata(blobHash);
+  if (!metadataEvent) {
+    throw new Error("No metadata event found for this blob hash");
+  }
+
+  const wrappedFDK = getTagValue(metadataEvent, "wrapped_key");
+  if (!wrappedFDK) {
+    throw new Error("Metadata missing wrapped_key tag");
+  }
+
+  const shareEvent = await fetchLatestShareEvent(blobHash, metadataEvent.pubkey);
+  if (!shareEvent) {
+    throw new Error("No share event found for this blob hash");
+  }
+
+  const encryptedFAK = getAccessKeyForRecipient(shareEvent, myPubkey);
+  if (!encryptedFAK) {
+    throw new Error("Current user has no access key entry for this file");
+  }
+
+  const fakHex = await decryptNIP44(encryptedFAK, shareEvent.pubkey);
+  const fak = hexToKey(fakHex);
+  const fdk = await unwrapKey(wrappedFDK, fak);
+
+  return {
+    myPubkey,
+    fdk,
+    fak,
+    metadataEvent,
+    shareEvent,
+  };
+}
 
 /**
  * Upload a file to encrypted drive
@@ -32,16 +120,18 @@ import {
  */
 export async function uploadFile(file, folderId = null, recipients = [], onProgress = () => {}) {
   const pubkey = await window.nostr.getPublicKey();
-  let key;
+  const allowlist = uniquePubkeys([pubkey, ...recipients]);
 
   // Read file
   onProgress("reading-file");
   const fileBuffer = await file.arrayBuffer();
 
-  // Encrypt
+  // Generate FDK/FAK and encrypt file payload
   onProgress("encrypting");
-  const { key: encKey, encrypted } = await encryptFile(fileBuffer);
-  key = encKey;
+  const fdk = await generateKey();
+  const fak = await generateKey();
+  const encrypted = await encryptFile(fileBuffer, fdk);
+  const wrappedFDK = await wrapKey(fdk, fak);
 
   // Upload blob
   onProgress("uploading");
@@ -54,33 +144,15 @@ export async function uploadFile(file, folderId = null, recipients = [], onProgr
     blobUrl: blob.url,
     mimeType: file.type || "application/octet-stream",
     fileSize: fileBuffer.byteLength,
-    encryptedSize: encrypted.byteLength,
     fileName: file.name,
     folderId,
+    wrappedFDK,
   });
 
-  // Publish owner self-share (always, for stateless key recovery)
-  onProgress("publishing-owner-share");
-  const keyHex = keyToHex(key);
-  const encryptedKey = await encryptNIP44(keyHex, pubkey);
-  await publishShareEvent({
-    blobHash: blob.sha256,
-    recipientPubkey: pubkey,
-    encryptedFileKey: encryptedKey,
-  });
-
-  // Publish shares for recipients
-  if (recipients.length > 0) {
-    onProgress("publishing-recipient-shares");
-    for (const recipientPubkey of recipients) {
-      const encKey = await encryptNIP44(keyHex, recipientPubkey);
-      await publishShareEvent({
-        blobHash: blob.sha256,
-        recipientPubkey,
-        encryptedFileKey: encKey,
-      });
-    }
-  }
+  // Publish one share event with allowlisted recipients and per-recipient encrypted FAK.
+  onProgress("publishing-share-event");
+  const recipientEntries = await buildRecipientAccessEntries(fak, allowlist);
+  await publishShareEvent({ blobHash: blob.sha256, recipients: recipientEntries });
 
   onProgress("complete");
   return {
@@ -100,7 +172,7 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
 
   // Resolve metadata first so we can recover original filename/type.
   onProgress("fetching-metadata-event");
-  const metadataEvent = await fetchFileMetadataByHash(blobHash);
+  const metadataEvent = await fetchLatestMetadata(blobHash);
   if (!metadataEvent) {
     throw new Error("No metadata event found for this blob hash");
   }
@@ -113,27 +185,29 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
   const mimeType = metadataEvent.tags.find((t) => t[0] === "m")?.[1] || "application/octet-stream";
   const fileName = metadataEvent.tags.find((t) => t[0] === "name")?.[1] || `decrypted-${blobHash.slice(0, 12)}`;
 
+  const wrappedFDK = getTagValue(metadataEvent, "wrapped_key");
+  if (!wrappedFDK) {
+    throw new Error("Metadata event missing wrapped_key tag");
+  }
+
   // Fetch share event for current user
   onProgress("fetching-share-event");
   const shares = await fetchSharesForUser(pubkey, blobHash);
+  const ownerShares = shares.filter((event) => event.pubkey === metadataEvent.pubkey);
+  const candidateShares = ownerShares.length > 0 ? ownerShares : shares;
+  candidateShares.sort((a, b) => b.created_at - a.created_at);
+  const shareEvent = candidateShares[0];
+  if (!shareEvent) throw new Error("No share event found for this blob");
 
-  if (shares.length === 0) {
-    throw new Error("No share event found for this blob");
-  }
-
-  // Prefer newest share event for this recipient/hash.
-  shares.sort((a, b) => b.created_at - a.created_at);
-  const shareEvent = shares[0];
-  const encryptedKeyTag = shareEvent.tags.find((t) => t[0] === "key");
-  if (!encryptedKeyTag) {
-    throw new Error("Share event missing 'key' tag");
-  }
-
-  // Decrypt file key from share
+  // Decrypt FAK from share, then unwrap FDK from metadata.
   onProgress("decrypting-key");
-  const senderPubkey = shareEvent.pubkey;
-  const decryptedKeyHex = await decryptNIP44(encryptedKeyTag[1], senderPubkey);
-  const key = hexToKey(decryptedKeyHex);
+  const encryptedFAK = getAccessKeyForRecipient(shareEvent, pubkey);
+  if (!encryptedFAK) {
+    throw new Error("Share event missing access key for this user");
+  }
+  const fakHex = await decryptNIP44(encryptedFAK, shareEvent.pubkey);
+  const fak = hexToKey(fakHex);
+  const fdk = await unwrapKey(wrappedFDK, fak);
 
   // Download encrypted blob
   onProgress("downloading-blob");
@@ -141,7 +215,7 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
 
   // Decrypt blob
   onProgress("decrypting-blob");
-  const plaintext = await decryptFile(encryptedBlob, key);
+  const plaintext = await decryptFile(encryptedBlob, fdk);
 
   const blob = new Blob([plaintext], { type: mimeType });
   return { blob, fileName, mimeType };
@@ -156,39 +230,166 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
  * @returns {Promise<void>}
  */
 export async function shareFile(blobHash, recipientPubkey, onProgress = () => {}) {
-  const pubkey = await window.nostr.getPublicKey();
+  onProgress("resolving-current-access");
+  const { myPubkey, fak, shareEvent } = await resolveCurrentKeyMaterial(blobHash);
 
-  // Fetch owner's self-share to recover key
-  onProgress("fetching-owner-share");
-  const shares = await fetchSharesForUser(pubkey, blobHash);
+  const existingRecipients = getAllTagValues(shareEvent, "p");
+  const recipients = uniquePubkeys([myPubkey, ...existingRecipients, recipientPubkey]);
 
-  const ownerShare = shares.find((s) => s.pubkey === pubkey);
-  if (!ownerShare) {
-    throw new Error("Cannot re-share: owner share event not found");
-  }
-
-  const keyTag = ownerShare.tags.find((t) => t[0] === "key");
-  if (!keyTag) {
-    throw new Error("Owner share event missing key");
-  }
-
-  // Decrypt key from owner share
-  onProgress("decrypting-owner-key");
-  const decryptedKeyHex = await decryptNIP44(keyTag[1], pubkey);
-
-  // Encrypt for recipient
-  onProgress("encrypting-for-recipient");
-  const encryptedKey = await encryptNIP44(decryptedKeyHex, recipientPubkey);
-
-  // Publish share event
   onProgress("publishing-share");
-  await publishShareEvent({
-    blobHash,
-    recipientPubkey,
-    encryptedFileKey: encryptedKey,
-  });
+  const recipientEntries = await buildRecipientAccessEntries(fak, recipients);
+  await publishShareEvent({ blobHash, recipients: recipientEntries });
 
   onProgress("complete");
+}
+
+/**
+ * Rotate FAK for a file while keeping recipient set unchanged.
+ * @param {string} blobHash - SHA256 hash of blob
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<void>}
+ */
+export async function rotateAccessKey(blobHash, onProgress = () => {}) {
+  onProgress("resolving-current-access");
+  const { myPubkey, fdk, metadataEvent, shareEvent } = await resolveCurrentKeyMaterial(blobHash);
+
+  const recipients = uniquePubkeys([myPubkey, ...getAllTagValues(shareEvent, "p")]);
+  const { fak: newFAK, wrappedFDK } = await rotateWrappedAccessKey(fdk);
+
+  onProgress("publishing-rotated-metadata");
+  await publishFileMetadata({
+    ...extractMetadataPayload(metadataEvent),
+    wrappedFDK,
+  });
+
+  onProgress("publishing-share");
+  const recipientEntries = await buildRecipientAccessEntries(newFAK, recipients);
+  await publishShareEvent({ blobHash, recipients: recipientEntries });
+
+  onProgress("complete");
+}
+
+/**
+ * Revoke a user by rotating FAK, rewrapping FDK, and republishing allowlist.
+ * @param {string} blobHash - SHA256 hash of blob
+ * @param {string} revokedPubkey - Pubkey to remove
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<void>}
+ */
+export async function revokeUser(blobHash, revokedPubkey, onProgress = () => {}) {
+  onProgress("resolving-current-access");
+  const { myPubkey, fdk, metadataEvent, shareEvent } = await resolveCurrentKeyMaterial(blobHash);
+
+  const recipients = uniquePubkeys([
+    myPubkey,
+    ...getAllTagValues(shareEvent, "p").filter((p) => p !== revokedPubkey),
+  ]);
+
+  const { fak: newFAK, wrappedFDK } = await rotateWrappedAccessKey(fdk);
+
+  onProgress("publishing-rotated-metadata");
+  await publishFileMetadata({
+    ...extractMetadataPayload(metadataEvent),
+    wrappedFDK,
+  });
+
+  onProgress("publishing-share");
+  const recipientEntries = await buildRecipientAccessEntries(newFAK, recipients);
+  await publishShareEvent({ blobHash, recipients: recipientEntries });
+
+  onProgress("complete");
+}
+
+/**
+ * Replace file allowlist and optionally rotate FAK.
+ * @param {string} blobHash - SHA256 hash of blob
+ * @param {string[]} recipients - Desired recipient pubkeys
+ * @param {{rotate?: boolean}} options - Rotation settings
+ * @param {Function} onProgress - Progress callback
+ * @returns {Promise<void>}
+ */
+export async function updateFileRecipients(blobHash, recipients, options = {}, onProgress = () => {}) {
+  const { rotate = true } = options;
+  onProgress("resolving-current-access");
+
+  const { myPubkey, fdk, fak, metadataEvent } = await resolveCurrentKeyMaterial(blobHash);
+  const finalRecipients = uniquePubkeys([myPubkey, ...(recipients || [])]);
+
+  let nextFAK = fak;
+  let wrappedFDK = getTagValue(metadataEvent, "wrapped_key");
+
+  if (rotate) {
+    const rotated = await rotateWrappedAccessKey(fdk);
+    nextFAK = rotated.fak;
+    wrappedFDK = rotated.wrappedFDK;
+
+    onProgress("publishing-rotated-metadata");
+    await publishFileMetadata({
+      ...extractMetadataPayload(metadataEvent),
+      wrappedFDK,
+    });
+  }
+
+  onProgress("publishing-share");
+  const recipientEntries = await buildRecipientAccessEntries(nextFAK, finalRecipients);
+  await publishShareEvent({ blobHash, recipients: recipientEntries });
+
+  onProgress("complete");
+}
+
+/**
+ * List current user's uploaded blobs from Blossom /list/:pubkey endpoint.
+ * @returns {Promise<Array>} List of blob descriptors
+ */
+export async function listMyUploads() {
+  const pubkey = await window.nostr.getPublicKey();
+  const authHeader = await getListAuthHeader(pubkey);
+  const baseUrl = getBlossomUrl();
+
+  const response = await fetch(`${baseUrl}/list/${pubkey}`, {
+    method: "GET",
+    headers: {
+      authorization: authHeader,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Unable to list uploads: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch current access state for an uploaded file.
+ * @param {string} blobHash - SHA256 hash of blob
+ * @returns {Promise<{ownerPubkey: string, recipients: string[]}>}
+ */
+export async function getFileAccessState(blobHash) {
+  const metadataEvent = await fetchLatestMetadata(blobHash);
+  if (!metadataEvent) {
+    return { ownerPubkey: "", recipients: [] };
+  }
+
+  let shareEvent = await fetchLatestShareEvent(blobHash, metadataEvent.pubkey);
+
+  // Fallback: query owner's recipient-scoped events and filter by file hash.
+  if (!shareEvent) {
+    const ownerShares = await fetchSharesForUser(metadataEvent.pubkey, blobHash);
+    const authoredShares = ownerShares.filter((event) => event.pubkey === metadataEvent.pubkey);
+    authoredShares.sort((a, b) => b.created_at - a.created_at);
+    shareEvent = authoredShares[0] || null;
+  }
+
+  if (!shareEvent) {
+    return { ownerPubkey: metadataEvent.pubkey, recipients: [metadataEvent.pubkey] };
+  }
+
+  const recipients = uniquePubkeys(getAllTagValues(shareEvent, "p"));
+  return {
+    ownerPubkey: metadataEvent.pubkey,
+    recipients,
+  };
 }
 
 /**

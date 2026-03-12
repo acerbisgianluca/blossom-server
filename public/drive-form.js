@@ -9,6 +9,10 @@ import {
 import {
   uploadFile as driveUpload,
   downloadFile as driveDownload,
+  listMyUploads,
+  getFileAccessState,
+  updateFileRecipients,
+  rotateAccessKey as driveRotateAccessKey,
 } from "./drive/drive.js";
 import { fetchSharedFilesForRecipient, subscribeToSharesForRecipient } from "./drive/nostr.js";
 
@@ -26,6 +30,14 @@ export class DriveForm extends LitElement {
     sharedUnreadCount: { state: true, type: Number },
     lastUploadUrl: { state: true, type: String },
     copiedUploadUrl: { state: true, type: Boolean },
+    uploads: { state: true },
+    uploadsLoading: { state: true, type: Boolean },
+    uploadRecipientDrafts: { state: true },
+    uploadRecipients: { state: true },
+    uploadRecipientInput: { state: true, type: String },
+    uploadRecipientInputs: { state: true },
+    sharedExternal: { state: true },
+    myPubkey: { state: true, type: String },
   };
 
   createRenderRoot() {
@@ -41,6 +53,14 @@ export class DriveForm extends LitElement {
     this.sharedUnreadCount = 0;
     this.lastUploadUrl = "";
     this.copiedUploadUrl = false;
+    this.uploads = [];
+    this.uploadsLoading = false;
+    this.uploadRecipientDrafts = {};
+    this.uploadRecipients = [];
+    this.uploadRecipientInput = "";
+    this.uploadRecipientInputs = {};
+    this.sharedExternal = [];
+    this.myPubkey = "";
     this._shareSubscriptionClose = null;
     this._isDestroyed = false;
   }
@@ -59,6 +79,9 @@ export class DriveForm extends LitElement {
     }
 
     await this.initSharedNotifications();
+    if (this.view === "uploads") {
+      await this.loadUploads();
+    }
   }
 
   updated(changedProperties) {
@@ -66,6 +89,12 @@ export class DriveForm extends LitElement {
       this.syncViewFromMode();
       if (this.view === "download") {
         this.prefillDownloadHashFromUrl();
+      }
+      if (this.view === "uploads") {
+        void this.loadUploads();
+      }
+      if (this.view === "shared") {
+        void this.loadSharedExternal();
       }
     }
 
@@ -79,7 +108,303 @@ export class DriveForm extends LitElement {
   }
 
   syncViewFromMode() {
-    this.view = this.mode === "download" ? "download" : "upload";
+    if (this.mode === "download") {
+      this.view = "download";
+      return;
+    }
+    if (this.mode === "uploads") {
+      this.view = "uploads";
+      return;
+    }
+    if (this.mode === "shared") {
+      this.view = "shared";
+      return;
+    }
+    this.view = "upload";
+  }
+
+  isOwnedByMe(item) {
+    if (!this.myPubkey || !item?.senderPubkey) return false;
+    return item.senderPubkey === this.myPubkey;
+  }
+
+  async loadSharedExternal() {
+    if (!(window.nostr && window.NostrTools)) return;
+    const myPubkey = this.myPubkey || await window.nostr.getPublicKey();
+    this.myPubkey = myPubkey;
+    this.sharedExternal = this.sharedWithMe.filter((item) => item.senderPubkey !== myPubkey);
+
+    if (this.sharedWithMe.length === 0) {
+      const items = await fetchSharedFilesForRecipient(myPubkey, 100);
+      this.sharedWithMe = items;
+      this.sharedExternal = items.filter((item) => item.senderPubkey !== myPubkey);
+    }
+  }
+
+  async loadUploads() {
+    if (!(window.nostr && window.NostrTools)) return;
+    this.uploadsLoading = true;
+
+    try {
+      const uploads = await listMyUploads();
+      const settled = await Promise.allSettled(
+        uploads.map(async (item) => {
+          const access = await getFileAccessState(item.sha256);
+          const recipientsExcludingOwner = access.recipients
+            .filter((p) => p !== access.ownerPubkey)
+            .map((p) => {
+              try {
+                return this.toNpub(p);
+              } catch {
+                return "";
+              }
+            })
+            .filter(Boolean);
+
+          const uniqueRecipients = [...new Set(recipientsExcludingOwner)];
+
+          return {
+            ...item,
+            ownerPubkey: access.ownerPubkey,
+            recipients: uniqueRecipients,
+            keyListError: false,
+          };
+        }),
+      );
+
+      const details = settled.map((result, index) => {
+        if (result.status === "fulfilled") {
+          return result.value;
+        }
+
+        return {
+          ...uploads[index],
+          ownerPubkey: "",
+          recipients: [],
+          keyListError: true,
+        };
+      });
+
+      this.uploads = details.sort((a, b) => (b.uploaded || 0) - (a.uploaded || 0));
+      const nextDrafts = {};
+      const nextInputs = {};
+      for (const upload of this.uploads) {
+        nextDrafts[upload.sha256] = [...(upload.recipients || [])];
+        nextInputs[upload.sha256] = "";
+      }
+      this.uploadRecipientDrafts = nextDrafts;
+      this.uploadRecipientInputs = nextInputs;
+    } catch (error) {
+      this.error = error.message;
+    } finally {
+      this.uploadsLoading = false;
+    }
+  }
+
+  formatUploadDate(unixTs) {
+    if (!unixTs) return "";
+    return new Date(unixTs * 1000).toLocaleString();
+  }
+
+  normalizeRecipient(value) {
+    return (value || "").trim();
+  }
+
+  toNpub(pubkey) {
+    if (!pubkey) return "";
+
+    if (pubkey.startsWith("npub")) {
+      const decoded = window.NostrTools?.nip19?.decode?.(pubkey);
+      if (!decoded || decoded.type !== "npub" || !decoded.data) {
+        throw new Error("Invalid npub recipient key");
+      }
+      return window.NostrTools?.nip19?.npubEncode?.(decoded.data) || pubkey;
+    }
+
+    if (/^[0-9a-f]{64}$/i.test(pubkey)) {
+      const encoded = window.NostrTools?.nip19?.npubEncode?.(pubkey.toLowerCase());
+      if (!encoded) {
+        throw new Error("Unable to convert pubkey to npub");
+      }
+      return encoded;
+    }
+
+    throw new Error("Recipient must be an npub or NIP-05 identifier");
+  }
+
+  async resolveRecipientToCanonical(input) {
+    const value = this.normalizeRecipient(input);
+    if (!value) {
+      throw new Error("Recipient is empty");
+    }
+
+    if (value.startsWith("npub")) {
+      return this.toNpub(value);
+    }
+
+    if (value.includes("@")) {
+      const profile = await window.NostrTools?.nip05?.queryProfile?.(value);
+      const resolvedHex = profile?.pubkey;
+      if (!resolvedHex || !/^[0-9a-f]{64}$/i.test(resolvedHex)) {
+        throw new Error(`Unable to resolve NIP-05 address: ${value}`);
+      }
+      return this.toNpub(resolvedHex);
+    }
+
+    throw new Error("Recipient must be npub1... or NIP-05 (name@domain)");
+  }
+
+  async addUploadRecipient() {
+    const rawRecipient = this.normalizeRecipient(this.uploadRecipientInput);
+    if (!rawRecipient) return;
+
+    let recipient;
+    try {
+      recipient = await this.resolveRecipientToCanonical(rawRecipient);
+    } catch (error) {
+      this.error = error.message;
+      return;
+    }
+
+    if (!recipient) return;
+    if (this.uploadRecipients.includes(recipient)) {
+      this.uploadRecipientInput = "";
+      return;
+    }
+
+    this.uploadRecipients = [...this.uploadRecipients, recipient];
+    this.uploadRecipientInput = "";
+  }
+
+  onUploadRecipientInputKeydown(e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void this.addUploadRecipient();
+    }
+  }
+
+  removeUploadRecipient(recipient) {
+    this.uploadRecipients = this.uploadRecipients.filter((p) => p !== recipient);
+  }
+
+  setListRecipientInput(blobHash, value) {
+    this.uploadRecipientInputs = {
+      ...this.uploadRecipientInputs,
+      [blobHash]: value,
+    };
+  }
+
+  async addListRecipient(blobHash) {
+    const rawRecipient = this.normalizeRecipient(this.uploadRecipientInputs[blobHash]);
+    if (!rawRecipient) return;
+
+    let recipient;
+    try {
+      recipient = await this.resolveRecipientToCanonical(rawRecipient);
+    } catch (error) {
+      this.error = error.message;
+      return;
+    }
+
+    if (!recipient) return;
+
+    const current = this.uploadRecipientDrafts[blobHash] || [];
+    if (current.includes(recipient)) {
+      this.setListRecipientInput(blobHash, "");
+      return;
+    }
+
+    this.uploadRecipientDrafts = {
+      ...this.uploadRecipientDrafts,
+      [blobHash]: [...current, recipient],
+    };
+    this.setListRecipientInput(blobHash, "");
+  }
+
+  onListRecipientInputKeydown(e, blobHash) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void this.addListRecipient(blobHash);
+    }
+  }
+
+  removeListRecipient(blobHash, recipient) {
+    const current = this.uploadRecipientDrafts[blobHash] || [];
+    this.uploadRecipientDrafts = {
+      ...this.uploadRecipientDrafts,
+      [blobHash]: current.filter((p) => p !== recipient),
+    };
+  }
+
+  renderRecipientChips(recipients, onRemove) {
+    if (!recipients || recipients.length === 0) {
+      return html`<p class="text-xs text-green-700">No recipients added yet.</p>`;
+    }
+
+    return html`<div class="mt-2 flex flex-wrap gap-2">
+      ${recipients.map(
+        (recipient) => html`<div class="flex items-center gap-2 rounded-full border border-green-800 bg-green-950/30 px-3 py-1">
+            <span class="font-mono text-xs text-green-300">${recipient}</span>
+            <button
+              type="button"
+              @click="${() => onRemove(recipient)}"
+              class="rounded-full border border-green-700 px-1 text-xs text-green-400 hover:bg-black"
+              title="Remove recipient"
+            >
+              🗑
+            </button>
+          </div>`,
+      )}
+    </div>`;
+  }
+
+  async saveRecipients(blobHash) {
+    try {
+      this.error = null;
+      this.status = "Updating recipients and rotating access key...";
+      const recipients = this.uploadRecipientDrafts[blobHash] || [];
+
+      await updateFileRecipients(blobHash, recipients, { rotate: true }, (stage) => {
+        const stageLabels = {
+          "resolving-current-access": "Resolving current file access...",
+          "publishing-rotated-metadata": "Publishing rotated metadata...",
+          "publishing-share": "Publishing allowlist share event...",
+          "complete": "Recipients updated.",
+        };
+        this.status = stageLabels[stage] || stage;
+      });
+
+      await this.loadUploads();
+      setTimeout(() => {
+        this.status = null;
+      }, 1200);
+    } catch (error) {
+      this.status = null;
+      this.error = error.message;
+    }
+  }
+
+  async regenerateKey(blobHash) {
+    try {
+      this.error = null;
+      this.status = "Rotating access key...";
+      await driveRotateAccessKey(blobHash, (stage) => {
+        const stageLabels = {
+          "resolving-current-access": "Resolving current file access...",
+          "publishing-rotated-metadata": "Publishing rotated metadata...",
+          "publishing-share": "Publishing allowlist share event...",
+          "complete": "Access key rotated.",
+        };
+        this.status = stageLabels[stage] || stage;
+      });
+      await this.loadUploads();
+      setTimeout(() => {
+        this.status = null;
+      }, 1200);
+    } catch (error) {
+      this.status = null;
+      this.error = error.message;
+    }
   }
 
   prefillDownloadHashFromUrl() {
@@ -97,7 +422,7 @@ export class DriveForm extends LitElement {
       new CustomEvent("drive-notifications", {
         detail: {
           unreadCount: this.sharedUnreadCount,
-          totalCount: this.sharedWithMe.length,
+          totalCount: this.sharedExternal.length,
           panelOpen: this.sharedPanelOpen,
         },
         bubbles: true,
@@ -141,18 +466,23 @@ export class DriveForm extends LitElement {
       }
 
       const myPubkey = await window.nostr.getPublicKey();
+      this.myPubkey = myPubkey;
 
       // Historical shares
       const items = await fetchSharedFilesForRecipient(myPubkey, 50);
       this.sharedWithMe = items;
+      this.sharedExternal = items.filter((item) => item.senderPubkey !== myPubkey);
 
       // Real-time updates
       this._shareSubscriptionClose = subscribeToSharesForRecipient(myPubkey, {
         onEvent: (item) => {
+          if (item.senderPubkey === myPubkey) return;
+
           const alreadySeen = this.sharedWithMe.some((existing) => existing.shareEventId === item.shareEventId);
           if (alreadySeen) return;
 
           this.sharedWithMe = [item, ...this.sharedWithMe].slice(0, 100);
+          this.sharedExternal = [item, ...this.sharedExternal].slice(0, 100);
           if (!this.sharedPanelOpen) {
             this.sharedUnreadCount += 1;
           }
@@ -196,6 +526,8 @@ export class DriveForm extends LitElement {
   renderSharedPanel() {
     if (!this.sharedPanelOpen) return null;
 
+    const visibleItems = this.sharedExternal;
+
     return html`
       <div class="mb-4 w-full overflow-hidden rounded-xl border border-green-900 bg-black shadow-xl">
         <div class="flex items-center justify-between border-b border-green-900 px-4 py-3">
@@ -208,9 +540,9 @@ export class DriveForm extends LitElement {
           </button>
         </div>
         <div class="max-h-80 overflow-auto">
-          ${this.sharedWithMe.length === 0
+          ${visibleItems.length === 0
             ? html`<div class="px-4 py-6 text-sm text-green-700">No shared files yet.</div>`
-            : this.sharedWithMe.map(
+            : visibleItems.map(
                 (item) => html`<button
                   @click="${() => this.openSharedItem(item)}"
                   class="w-full border-b border-green-950 px-4 py-3 text-left hover:bg-green-950"
@@ -274,19 +606,15 @@ export class DriveForm extends LitElement {
       this.lastUploadUrl = "";
       this.copiedUploadUrl = false;
 
-      const recipients = document.querySelector("[name='upload-recipients']")?.value
-        .split(",")
-        .map((s) => s.trim())
-        .filter((s) => s) || [];
+      const recipientsToShare = [...this.uploadRecipients];
 
-      const result = await driveUpload(this.selectedFile, null, recipients, (stage) => {
+      const result = await driveUpload(this.selectedFile, null, recipientsToShare, (stage) => {
         const stageLabels = {
           "reading-file": "Reading file...",
           "encrypting": "Encrypting...",
           "uploading": "Uploading to Blossom...",
           "publishing-metadata": "Publishing metadata event...",
-          "publishing-owner-share": "Publishing owner share event...",
-          "publishing-recipient-shares": "Publishing recipient shares...",
+          "publishing-share-event": "Publishing allowlist share event...",
           "complete": "Upload complete!",
         };
         this.status = stageLabels[stage] || stage;
@@ -303,6 +631,8 @@ export class DriveForm extends LitElement {
 
       setTimeout(() => {
         this.selectedFile = null;
+        this.uploadRecipients = [];
+        this.uploadRecipientInput = "";
         this.status = null;
       }, 2000);
     } catch (err) {
@@ -417,14 +747,28 @@ export class DriveForm extends LitElement {
             </div>
           </div>
 
-          <label class="text-sm font-bold text-green-500">
-            Share with pubkeys (optional, comma-separated)
-            <textarea
-              name="upload-recipients"
-              class="mt-1 block h-20 w-full rounded-md border border-green-900 bg-black p-3 font-mono text-xs text-green-400"
-              placeholder="npub1abc...,npub1def..."
-            ></textarea>
-          </label>
+          <div>
+            <label class="text-sm font-bold text-green-500">Share with pubkeys (optional)</label>
+            <div class="mt-1 flex gap-2">
+              <input
+                type="text"
+                class="block w-full rounded-md border border-green-900 bg-black p-3 font-mono text-xs text-green-400"
+                placeholder="npub1abc... or name@domain.com"
+                .value="${this.uploadRecipientInput || ""}"
+                @input="${(e) => (this.uploadRecipientInput = e.target.value)}"
+                @keydown="${this.onUploadRecipientInputKeydown}"
+              />
+              <button
+                type="button"
+                @click="${() => this.addUploadRecipient()}"
+                class="rounded-md border border-green-700 px-4 py-2 text-lg font-semibold text-green-300 hover:bg-green-950"
+                title="Add recipient"
+              >
+                +
+              </button>
+            </div>
+            ${this.renderRecipientChips(this.uploadRecipients, (recipient) => this.removeUploadRecipient(recipient))}
+          </div>
 
           <button
             type="submit"
@@ -496,8 +840,141 @@ export class DriveForm extends LitElement {
     `;
   }
 
+  renderUploads() {
+    return html`
+      <div class="w-full rounded-2xl border border-green-900 bg-black px-6 pb-6 pt-7 shadow-xl sm:px-8">
+        <div class="mb-6 flex items-center justify-between gap-3">
+          <div>
+            <h1 class="mb-2 text-2xl font-bold text-green-300">My Uploads</h1>
+            <p class="text-sm text-green-700">Manage recipient allowlist and rotate access keys without reuploading blobs.</p>
+          </div>
+          <button
+            type="button"
+            @click="${() => this.loadUploads()}"
+            class="rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
+          >
+            Refresh
+          </button>
+        </div>
+
+        ${this.uploadsLoading
+          ? html`<p class="text-sm text-green-600">Loading uploads...</p>`
+          : this.uploads.length === 0
+            ? html`<p class="text-sm text-green-700">No uploads found for this account.</p>`
+            : html`${this.uploads.map(
+                (item) => html`
+                  <div class="mb-4 rounded-lg border border-green-900 bg-black p-4">
+                    <div class="mb-2 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                      <div class="font-mono text-xs text-green-500">${item.sha256}</div>
+                      <div class="text-xs text-green-700">${formatBytes(item.size || 0)} · ${this.formatUploadDate(item.uploaded)}</div>
+                    </div>
+
+                    ${item.keyListError
+                      ? html`<p class="mb-2 text-xs text-amber-500">Unable to fetch recipients from relays. You can still set and save a new allowlist.</p>`
+                      : null}
+
+                    <label class="mb-2 block text-xs font-semibold uppercase tracking-wide text-green-600">
+                      Allowed recipients (owner is always retained)
+                    </label>
+                    <div class="mb-2 flex gap-2">
+                      <input
+                        type="text"
+                        class="block w-full rounded-md border border-green-900 bg-black p-3 font-mono text-xs text-green-400"
+                        placeholder="npub1abc... or name@domain.com"
+                        .value="${this.uploadRecipientInputs[item.sha256] || ""}"
+                        @input="${(e) => this.setListRecipientInput(item.sha256, e.target.value)}"
+                        @keydown="${(e) => this.onListRecipientInputKeydown(e, item.sha256)}"
+                      />
+                      <button
+                        type="button"
+                        @click="${() => this.addListRecipient(item.sha256)}"
+                        class="rounded-md border border-green-700 px-4 py-2 text-lg font-semibold text-green-300 hover:bg-green-950"
+                        title="Add recipient"
+                      >
+                        +
+                      </button>
+                    </div>
+
+                    ${this.renderRecipientChips(
+                      this.uploadRecipientDrafts[item.sha256] || [],
+                      (recipient) => this.removeListRecipient(item.sha256, recipient),
+                    )}
+
+                    <div class="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        @click="${() => this.saveRecipients(item.sha256)}"
+                        class="rounded-md bg-green-500 px-3 py-2 text-sm font-semibold text-black hover:bg-green-400"
+                      >
+                        Save Recipients + Regenerate Key
+                      </button>
+                      <button
+                        type="button"
+                        @click="${() => this.regenerateKey(item.sha256)}"
+                        class="rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
+                      >
+                        Regenerate Key Only
+                      </button>
+                    </div>
+                  </div>
+                `,
+              )}`}
+      </div>
+    `;
+  }
+
+  renderSharedView() {
+    return html`
+      <div class="w-full rounded-2xl border border-green-900 bg-black px-6 pb-6 pt-7 shadow-xl sm:px-8">
+        <div class="mb-6 flex items-center justify-between gap-3">
+          <div>
+            <h1 class="mb-2 text-2xl font-bold text-green-300">Shared With Me</h1>
+            <p class="text-sm text-green-700">Files shared by other users. Your own uploads are excluded.</p>
+          </div>
+          <button
+            type="button"
+            @click="${() => this.loadSharedExternal()}"
+            class="rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
+          >
+            Refresh
+          </button>
+        </div>
+
+        ${this.sharedExternal.length === 0
+          ? html`<p class="text-sm text-green-700">No files shared with you yet.</p>`
+          : html`${this.sharedExternal.map(
+              (item) => html`
+                <div class="mb-3 rounded-lg border border-green-900 bg-black p-4">
+                  <div class="truncate text-sm font-medium text-green-300">${item.fileName}</div>
+                  <div class="mt-1 truncate font-mono text-xs text-green-600">${item.blobHash}</div>
+                  <div class="mt-1 text-xs text-green-700">
+                    from ${this.shortPubkey(item.senderPubkey)} · ${this.formatSharedDate(item.sharedAt)}
+                  </div>
+                  <div class="mt-3">
+                    <button
+                      type="button"
+                      @click="${() => this.openSharedItem(item)}"
+                      class="rounded-md bg-green-500 px-3 py-2 text-sm font-semibold text-black hover:bg-green-400"
+                    >
+                      Open File
+                    </button>
+                  </div>
+                </div>
+              `,
+            )}`}
+      </div>
+    `;
+  }
+
   render() {
-    const content = this.view === "download" ? this.renderDownload() : this.renderUpload();
+    let content = this.renderUpload();
+    if (this.view === "download") {
+      content = this.renderDownload();
+    } else if (this.view === "uploads") {
+      content = this.renderUploads();
+    } else if (this.view === "shared") {
+      content = this.renderSharedView();
+    }
 
     const statusBar = this.status
       ? html`<div class="fixed bottom-4 right-4 rounded border border-green-700 bg-black p-4 text-green-400">

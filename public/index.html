@@ -4,6 +4,55 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link href="./lib/tailwind.min.css" rel="stylesheet" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <style>
+      :root {
+        --matrix-bg: #000000;
+        --matrix-green: #22c55e;
+        --matrix-green-soft: #14532d;
+      }
+
+      html,
+      body {
+        min-height: 100%;
+        margin: 0;
+      }
+
+      body {
+        font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+        background: var(--matrix-bg);
+        color: var(--matrix-green);
+      }
+
+      .app-atmosphere {
+        background-image: repeating-linear-gradient(
+          180deg,
+          rgba(34, 197, 94, 0.06) 0,
+          rgba(34, 197, 94, 0.06) 1px,
+          transparent 1px,
+          transparent 4px
+        );
+        pointer-events: none;
+      }
+
+      input,
+      textarea {
+        color: var(--matrix-green);
+        background: #000;
+        border-color: var(--matrix-green-soft);
+      }
+
+      input::placeholder,
+      textarea::placeholder {
+        color: #15803d;
+      }
+    </style>
 
     <title>Blossom Server</title>
     <script type="module" src="./main.js"></script>
@@ -11,15 +60,23 @@
   <body>
     <blossom-app></blossom-app>
 
+    <!-- nostr-tools: Nostr relay/event utilities -->
+
+    <script type="module">
+      import { SimplePool, verifyEvent, nip44, nip19 } from "https://esm.sh/nostr-tools@2.10.4";
+      window.NostrTools = { SimplePool, verifyEvent, nip44, nip19 };
+    </script>
     <script>
       window.wnjParams = {
         position: "top",
         // Supported values: cyan (default), green, purple, red, orange, neutral, stone
-        accent: "purple",
+        accent: "cyan",
         compactMode: true,
+        startHidden: false,
+        right: 16,
         disableOverflowFix: true,
       };
     </script>
-    <script src="./lib/window.nostr.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/window.nostr.js/dist/window.nostr.min.js"></script>
   </body>
 </html>

@@ -42,6 +42,7 @@ router.get("/:hash", range, async (ctx, next) => {
     ctx.length = storageResult.size;
 
     // koa cannot set Content-Length from stream
+    ctx.attachment(hash)
     ctx.body = await readStoragePointer(storageResult);
     return;
   }

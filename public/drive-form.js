@@ -6,6 +6,8 @@ import { html, LitElement } from "./lib/lit.min.js";
 import { formatBytes } from "./utils.js";
 import {
   createFolder,
+  deleteFile,
+  deleteFolder,
   downloadFile,
   getFolderRecipients,
   listFiles,
@@ -639,6 +641,52 @@ export class DriveForm extends LitElement {
     this.status = `Downloaded ${downloaded} file${downloaded === 1 ? "" : "s"}.`;
   }
 
+  async deleteFileItem(fileItem) {
+    if (!fileItem) return;
+
+    const confirmed = window.confirm("Delete this file? This action cannot be undone.");
+    if (!confirmed) return;
+
+    if (fileItem.uploader !== this.myPubkey) {
+      this.folderFiles = this.folderFiles.filter((item) => item.blobHash !== fileItem.blobHash);
+      this.status = `Removed ${fileItem.fileName} from your list.`;
+      return;
+    }
+
+    try {
+      this.error = "";
+      this.status = `Deleting ${fileItem.fileName}...`;
+      await deleteFile(fileItem.blobHash);
+      await this.selectFolder(this.selectedFolder);
+      await this.refreshSidebarData();
+      this.status = `Deleted ${fileItem.fileName}.`;
+    } catch (error) {
+      this.error = error.message;
+      this.status = "";
+    }
+  }
+
+  async deleteSelectedFolder() {
+    if (!this.selectedFolder) return;
+    if (this.selectedFolder.ownerPubkey !== this.myPubkey) return;
+
+    const confirmed = window.confirm("Delete this folder and all files inside?");
+    if (!confirmed) return;
+
+    try {
+      this.error = "";
+      this.status = `Deleting ${this.selectedFolder.folderName}...`;
+      await deleteFolder(this.selectedFolder.folderId);
+      this.selectedFolder = null;
+      this.folderFiles = [];
+      await this.refreshSidebarData();
+      this.status = "Folder deleted.";
+    } catch (error) {
+      this.error = error.message;
+      this.status = "";
+    }
+  }
+
   formatDate(unixTs) {
     if (!unixTs) return "";
     return new Date(unixTs * 1000).toLocaleString();
@@ -1031,6 +1079,8 @@ export class DriveForm extends LitElement {
       return html`<div class="rounded-xl border border-green-900 bg-black p-6 text-sm text-green-600">Loading files…</div>`;
     }
 
+    const isOwnedFolder = this.selectedFolder.ownerPubkey === this.myPubkey;
+
     return html`
       <div class="rounded-xl border border-green-900 bg-black p-4">
         <div class="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1040,15 +1090,26 @@ export class DriveForm extends LitElement {
               ${this.folderFiles.length} file${this.folderFiles.length === 1 ? "" : "s"} · owner ${this.shortPubkey(this.selectedFolder.ownerPubkey)}
             </p>
           </div>
-          ${this.folderFiles.length > 0
-            ? html`<button
-                type="button"
-                @click="${() => this.downloadAllFiles()}"
-                class="shrink-0 rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
-              >
-                ⬇ Download All
-              </button>`
-            : null}
+          <div class="flex shrink-0 flex-wrap gap-2">
+            ${this.folderFiles.length > 0
+              ? html`<button
+                  type="button"
+                  @click="${() => this.downloadAllFiles()}"
+                  class="rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
+                >
+                  ⬇ Download All
+                </button>`
+              : null}
+            ${isOwnedFolder
+              ? html`<button
+                  type="button"
+                  @click="${() => this.deleteSelectedFolder()}"
+                  class="rounded-md border border-red-700 px-3 py-2 text-sm text-red-300 hover:bg-red-950"
+                >
+                  Delete Folder
+                </button>`
+              : null}
+          </div>
         </div>
 
         ${this.folderFiles.length === 0
@@ -1072,13 +1133,24 @@ export class DriveForm extends LitElement {
                       <td class="py-2.5 pr-4 text-green-700">${this.formatDate(fileItem.uploadedAt)}</td>
                       <td class="py-2.5 pr-4 text-green-700">${this.shortPubkey(fileItem.uploader)}</td>
                       <td class="py-2.5 text-right">
-                        <button
-                          type="button"
-                          @click="${() => this.downloadItem(fileItem)}"
-                          class="rounded-md bg-green-500 px-3 py-1.5 text-sm font-semibold text-black hover:bg-green-400"
-                        >
-                          Download
-                        </button>
+                        <div class="flex justify-end gap-2">
+                          <button
+                            type="button"
+                            @click="${() => this.downloadItem(fileItem)}"
+                            class="rounded-md bg-green-500 px-3 py-1.5 text-sm font-semibold text-black hover:bg-green-400"
+                          >
+                            Download
+                          </button>
+                          ${isOwnedFolder
+                            ? html`<button
+                                type="button"
+                                @click="${() => this.deleteFileItem(fileItem)}"
+                                class="rounded-md border border-red-700 px-3 py-1.5 text-sm text-red-300 hover:bg-red-950"
+                              >
+                                Delete
+                              </button>`
+                            : null}
+                        </div>
                       </td>
                     </tr>`,
                   )}

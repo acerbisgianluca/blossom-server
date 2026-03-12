@@ -12,6 +12,7 @@ import {
 import { downloadBlob, uploadBlob } from "./blossom.js";
 import { getBlossomUrl } from "./config.js";
 import { newExpirationValue, unixNow } from "../utils.js";
+import { deleteFile as deleteFileRecord, deleteFolder as deleteFolderRecord } from "./deletion.js";
 import {
   fetchFilesInFolder,
   fetchFolder,
@@ -273,4 +274,12 @@ export async function getFolderRecipients(folderId, ownerPubkey = null) {
 
 export async function listRawUploads() {
   return getUploadsFromBlossom();
+}
+
+export async function deleteFile(blobHash) {
+  return deleteFileRecord(blobHash);
+}
+
+export async function deleteFolder(folderId) {
+  return deleteFolderRecord(folderId);
 }

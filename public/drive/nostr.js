@@ -1,17 +1,69 @@
 /**
- * Nostr event module for folder/file/share events
- * Uses nostr-tools for relay communication
+ * Nostr event module for folder-based encrypted sharing.
  */
 
 import { RELAYS, EVENT_KINDS } from "./config.js";
 import { unixNow } from "../utils.js";
 
-// Global relay pool (initialized lazily)
 let pool = null;
+let lastPublishedCreatedAt = 0;
 
-/**
- * Initialize relay pool with nostr-tools
- */
+function nextCreatedAt(proposedCreatedAt = unixNow()) {
+  const nextValue = Math.max(proposedCreatedAt, lastPublishedCreatedAt + 1);
+  lastPublishedCreatedAt = nextValue;
+  return nextValue;
+}
+
+function getEventVersion(event) {
+  const rawVersion = getTagValue(event, "version");
+  const parsedVersion = Number.parseInt(rawVersion || "0", 10);
+  return Number.isFinite(parsedVersion) ? parsedVersion : 0;
+}
+
+function compareEventsNewestFirst(left, right) {
+  const leftVersion = getEventVersion(left);
+  const rightVersion = getEventVersion(right);
+  if (leftVersion !== rightVersion) {
+    return rightVersion - leftVersion;
+  }
+
+  if (left.created_at !== right.created_at) {
+    return right.created_at - left.created_at;
+  }
+
+  return (right.id || "").localeCompare(left.id || "");
+}
+
+function isEventNewer(candidate, existing) {
+  if (!existing) return true;
+  return compareEventsNewestFirst(candidate, existing) < 0;
+}
+
+function getFileEventIdentity(event, folderId) {
+  const explicitId = getTagValue(event, "file_id");
+  if (explicitId) {
+    return `file_id:${explicitId}`;
+  }
+
+  return [
+    getTagValue(event, "x") || "",
+    getTagValue(event, "url") || "",
+    getTagValue(event, "name") || "",
+    getTagValue(event, "size") || "",
+    getTagValue(event, "m") || "",
+    folderId || "",
+  ].join("|");
+}
+
+function createFileId() {
+  if (typeof window.crypto?.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+
+  const bytes = window.crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
 export function initRelayPool() {
   if (pool) return pool;
 
@@ -19,29 +71,22 @@ export function initRelayPool() {
   if (!SimplePool) {
     throw new Error("nostr-tools not loaded. Please refresh the page.");
   }
+
   pool = new SimplePool();
   return pool;
 }
 
-/**
- * Publish an event to all configured relays
- * @param {Object} event - Nostr event struct
- * @returns {Promise<{id: string, acceptedRelays: string[]}>} Event id and relays that accepted
- */
 export async function publishEvent(unsigned) {
-  // Sign event
-  const event = await window.nostr.signEvent(unsigned);
-
-  // Publish to all relays
+  const event = await window.nostr.signEvent({
+    ...unsigned,
+    created_at: nextCreatedAt(unsigned.created_at),
+  });
   const relayPool = initRelayPool();
-  const relayUrls = RELAYS;
-
-  const publishPromises = relayPool.publish(relayUrls, event);
+  const publishPromises = relayPool.publish(RELAYS, event);
   const settled = await Promise.allSettled(publishPromises);
-
   const acceptedRelays = settled
-    .map((result, index) => (result.status === "fulfilled" ? relayUrls[index] : null))
-    .filter((url) => url !== null);
+    .map((result, index) => (result.status === "fulfilled" ? RELAYS[index] : null))
+    .filter(Boolean);
 
   if (acceptedRelays.length === 0) {
     throw new Error("Failed to publish event to any relay");
@@ -50,25 +95,12 @@ export async function publishEvent(unsigned) {
   return { id: event.id, acceptedRelays };
 }
 
-/**
- * Fetch events from relays
- * @param {Object} filter - Nostr filter (kinds, authors, #x, etc.)
- * @param {number} timeoutMs - Timeout for fetch
- * @returns {Promise<Array>} Array of events
- */
 export async function fetchEvents(filter, timeoutMs = 5000) {
-  const pool = initRelayPool();
-
-  const events = await pool.querySync(RELAYS, filter, { timeout: timeoutMs });
+  const relayPool = initRelayPool();
+  const events = await relayPool.querySync(RELAYS, filter, { timeout: timeoutMs });
   return events || [];
 }
 
-/**
- * Create and publish a folder event (kind 50000)
- * @param {string} folderId - Unique folder ID
- * @param {string} folderName - Human-readable folder name
- * @returns {Promise<string>} Event ID
- */
 export async function publishFolderEvent(folderId, folderName) {
   const result = await publishEvent({
     kind: EVENT_KINDS.FOLDER,
@@ -83,312 +115,294 @@ export async function publishFolderEvent(folderId, folderName) {
   return result.id;
 }
 
-/**
- * Create and publish a file metadata event (kind 1063, NIP-94)
- * @param {Object} metadata - File metadata
- * @returns {Promise<string>} Event ID
- */
 export async function publishFileMetadata(metadata) {
   const {
     blobHash,
     blobUrl,
+    createdAt,
     mimeType,
     fileSize,
+    fileVersion,
     folderId,
     fileName,
+    fileId,
     wrappedFDK,
   } = metadata;
 
+  if (!folderId) {
+    throw new Error("File metadata requires a folder_id");
+  }
+
   const pubkey = await window.nostr.getPublicKey();
+  const folderRef = getFolderAddress(pubkey, folderId);
+
   const tags = [
+    ["file_id", fileId || createFileId()],
+    ["version", String(fileVersion || 1)],
     ["x", blobHash],
     ["url", blobUrl],
     ["m", mimeType],
     ["size", fileSize.toString()],
+    ["folder", folderRef],
+    ["wrapped_fdk", wrappedFDK],
     ["enc", "aes-256-gcm"],
-    ["wrapped_key", wrappedFDK],
   ];
 
   if (fileName) {
     tags.push(["name", fileName]);
   }
 
-  // Add folder reference if present
-  if (folderId) {
-    tags.push(["folder", folderId]);
-    tags.push(["a", `${EVENT_KINDS.FOLDER}:${pubkey}:${folderId}`]);
-  }
-
   const result = await publishEvent({
     kind: EVENT_KINDS.FILE_METADATA,
     content: "",
-    created_at: unixNow(),
+    created_at: createdAt || unixNow(),
     tags,
   });
 
   return result.id;
 }
 
-/**
- * Create and publish a single share event for a file allowlist.
- * Uses one event per file with many recipient tags and per-recipient encrypted FAK tags.
- * @param {Object} shareData - Share information
- * @returns {Promise<string>} Event ID
- */
-export async function publishShareEvent(shareData) {
-  const {
-    blobHash,
-    recipients,
-  } = shareData;
+export async function publishDeletionEvent(eventId, reason = "") {
+  if (!eventId) {
+    throw new Error("Missing event id for deletion");
+  }
 
-  const uniqueRecipients = [...new Set((recipients || []).map((r) => normalizePubkey(r.pubkey)))];
-  const accessByPubkey = new Map(
-    (recipients || []).map((r) => [normalizePubkey(r.pubkey), r.encryptedFAK]),
+  const result = await publishEvent({
+    kind: 5,
+    content: reason || "",
+    created_at: unixNow(),
+    tags: [["e", eventId]],
+  });
+
+  return result.id;
+}
+
+export async function publishFolderShare(shareData) {
+  const { createdAt, folderId, recipients, version } = shareData;
+  const uniqueRecipients = [...new Set((recipients || []).map((item) => normalizePubkey(item.pubkey)))];
+  const accessByRecipient = new Map(
+    (recipients || []).map((item) => [normalizePubkey(item.pubkey), item.encryptedFolderKey]),
   );
 
-  if (!blobHash) {
-    throw new Error("Missing blob hash for share event");
+  if (!folderId) {
+    throw new Error("Missing folder id for folder share event");
   }
 
   if (uniqueRecipients.length === 0) {
-    throw new Error("Cannot publish share event without recipients");
+    throw new Error("Cannot publish folder share event without recipients");
   }
 
-  const tags = [["d", blobHash], ["file", blobHash]];
+  const tags = [["d", folderId], ["folder", folderId], ["version", String(version || 1)]];
   for (const recipient of uniqueRecipients) {
     tags.push(["p", recipient]);
-    const encryptedFAK = accessByPubkey.get(recipient);
-    if (!encryptedFAK) {
-      throw new Error(`Missing encrypted FAK for recipient ${recipient}`);
+    const encryptedFolderKey = accessByRecipient.get(recipient);
+    if (!encryptedFolderKey) {
+      throw new Error(`Missing encrypted folder key for recipient ${recipient}`);
     }
-    tags.push(["access_key", recipient, encryptedFAK]);
+    tags.push(["access_key", recipient, encryptedFolderKey]);
   }
 
   const result = await publishEvent({
     kind: EVENT_KINDS.SHARE,
     content: "",
-    created_at: unixNow(),
+    created_at: createdAt || unixNow(),
     tags,
   });
 
   return result.id;
 }
 
-/**
- * Fetch all file metadata events for a user in a folder
- * @param {string} pubkey - Author pubkey
- * @param {string} folderId - Optional folder ID
- * @returns {Promise<Array>} File metadata events
- */
-export async function fetchFilesForUser(pubkey, folderId = null) {
-  const filter = {
-    kinds: [EVENT_KINDS.FILE_METADATA],
-    authors: [pubkey],
-  };
-
-  // Filter by folder address if specified
-  if (folderId) {
-    filter["#a"] = [`${EVENT_KINDS.FOLDER}:${pubkey}:${folderId}`];
-  }
-
-  return fetchEvents(filter);
-}
-
-/**
- * Fetch all share events for the current user
- * @param {string} pubkey - Recipient pubkey
- * @param {string} blobHash - Optional blob hash to filter
- * @returns {Promise<Array>} Share events
- */
-export async function fetchSharesForUser(pubkey, blobHash = null) {
+export async function fetchUserFolders(pubkey) {
   const normalizedPubkey = normalizePubkey(pubkey);
-
-  const filter = {
-    kinds: [EVENT_KINDS.SHARE],
-    "#p": [normalizedPubkey],
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.FOLDER],
+    authors: [normalizedPubkey],
     limit: 200,
-  };
+  });
 
-  if (blobHash) {
-    filter["#d"] = [blobHash];
+  const latestByFolderId = new Map();
+  for (const event of events) {
+    const folderId = getTagValue(event, "d");
+    if (!folderId) continue;
+
+    const existing = latestByFolderId.get(folderId);
+    if (isEventNewer(event, existing)) {
+      latestByFolderId.set(folderId, event);
+    }
   }
 
-  // NOTE: many relays don't index non-standard multi-letter tags such as #file.
-  // Query by recipient and filter by the custom "file" tag client-side.
-  const events = await fetchEvents(filter);
-
-  if (!blobHash) return events;
-  return events.filter((event) => event.tags.some((tag) => tag[0] === "file" && tag[1] === blobHash));
+  return [...latestByFolderId.values()].sort(compareEventsNewestFirst);
 }
 
-/**
- * Fetch latest share event for a file.
- * @param {string} blobHash - Blob hash
- * @param {string|null} authorPubkey - Optional author pubkey filter
- * @returns {Promise<Object|null>} Latest share event or null
- */
-export async function fetchLatestShareEvent(blobHash, authorPubkey = null) {
-  const normalizedAuthor = authorPubkey ? normalizePubkey(authorPubkey) : null;
+export async function fetchFilesInFolder(ownerPubkey, folderId) {
+  const normalizedPubkey = normalizePubkey(ownerPubkey);
+  const addressableRef = getFolderAddress(normalizedPubkey, folderId);
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.FILE_METADATA],
+    authors: [normalizedPubkey],
+    limit: 500,
+  });
+
+  const latestByFileIdentity = new Map();
+
+  for (const event of events) {
+    const folderRef = getTagValue(event, "folder");
+    const rawFolderId = getFolderIdFromRef(folderRef);
+    if (folderRef !== addressableRef && rawFolderId !== folderId) {
+      continue;
+    }
+
+    const identity = getFileEventIdentity(event, rawFolderId || folderId);
+    const existing = latestByFileIdentity.get(identity);
+    if (isEventNewer(event, existing)) {
+      latestByFileIdentity.set(identity, event);
+    }
+  }
+
+  return [...latestByFileIdentity.values()]
+    .filter((event) => {
+      const folderRef = getTagValue(event, "folder");
+      const rawFolderId = getFolderIdFromRef(folderRef);
+      return folderRef === addressableRef || rawFolderId === folderId;
+    })
+    .sort(compareEventsNewestFirst);
+}
+
+export async function fetchFolderShares({ recipientPubkey = null, folderId = null, ownerPubkey = null } = {}) {
   const filter = {
     kinds: [EVENT_KINDS.SHARE],
-    "#d": [blobHash],
-    limit: 20,
+    limit: 300,
   };
 
-  if (normalizedAuthor) {
-    filter.authors = [normalizedAuthor];
+  if (recipientPubkey) {
+    filter["#p"] = [normalizePubkey(recipientPubkey)];
+  }
+
+  if (ownerPubkey) {
+    filter.authors = [normalizePubkey(ownerPubkey)];
   }
 
   let events = await fetchEvents(filter);
 
-  // Fallback for relays that do not index #d as expected.
-  if (!events.length && normalizedAuthor) {
+  if (!events.length && ownerPubkey) {
     events = await fetchEvents({
       kinds: [EVENT_KINDS.SHARE],
-      authors: [normalizedAuthor],
-      limit: 200,
+      authors: [normalizePubkey(ownerPubkey)],
+      limit: 300,
     });
   }
 
-  if (!events.length) {
-    events = await fetchEvents({
-      kinds: [EVENT_KINDS.SHARE],
-      limit: 200,
+  if (folderId) {
+    events = events.filter((event) => {
+      const dTag = getTagValue(event, "d");
+      const folderTag = getTagValue(event, "folder");
+      return dTag === folderId || folderTag === folderId;
     });
   }
 
-  events = events.filter((event) => {
-    if (normalizedAuthor && event.pubkey !== normalizedAuthor) return false;
-    const dTag = event.tags.find((t) => t[0] === "d")?.[1];
-    const fileTag = event.tags.find((t) => t[0] === "file")?.[1];
-    return dTag === blobHash || fileTag === blobHash;
-  });
-
-  if (!events.length) return null;
-  events.sort((a, b) => b.created_at - a.created_at);
-  return events[0];
+  return events.sort(compareEventsNewestFirst);
 }
 
-/**
- * Fetch folder event
- * @param {string} pubkey - Folder owner pubkey
- * @param {string} folderId - Folder ID
- * @returns {Promise<Object|null>} Folder event or null
- */
-export async function fetchFolder(pubkey, folderId) {
-  const events = await fetchEvents({
-    kinds: [EVENT_KINDS.FOLDER],
-    authors: [pubkey],
-    "#d": [folderId],
-  });
-
+export async function fetchLatestFolderShare(folderId, ownerPubkey = null) {
+  const events = await fetchFolderShares({ folderId, ownerPubkey });
   return events[0] || null;
 }
 
-/**
- * Fetch file metadata by encrypted blob hash (kind 1063, tag x)
- * @param {string} blobHash - SHA256 hash of encrypted blob
- * @returns {Promise<Object|null>} Metadata event or null
- */
+export async function fetchFolder(pubkey, folderId) {
+  const normalizedPubkey = normalizePubkey(pubkey);
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.FOLDER],
+    authors: [normalizedPubkey],
+    "#d": [folderId],
+    limit: 50,
+  });
+
+  if (events.length > 0) {
+    events.sort(compareEventsNewestFirst);
+    return events[0];
+  }
+
+  const allAuthorFolders = await fetchUserFolders(normalizedPubkey);
+  return allAuthorFolders.find((event) => getTagValue(event, "d") === folderId) || null;
+}
+
 export async function fetchFileMetadataByHash(blobHash) {
   const events = await fetchEvents({
     kinds: [EVENT_KINDS.FILE_METADATA],
     "#x": [blobHash],
-    limit: 20,
+    limit: 50,
   });
 
   if (!events.length) return null;
-
-  // Prefer newest metadata event for this hash.
-  events.sort((a, b) => b.created_at - a.created_at);
+  events.sort(compareEventsNewestFirst);
   return events[0];
 }
 
-/**
- * Fetch latest metadata for a blob hash.
- * @param {string} blobHash - SHA256 hash of encrypted blob
- * @returns {Promise<Object|null>} Metadata event or null
- */
+export async function fetchFileMetadata(blobHash) {
+  return fetchFileMetadataByHash(blobHash);
+}
+
 export async function fetchLatestMetadata(blobHash) {
   return fetchFileMetadataByHash(blobHash);
 }
 
-export function getTagValue(event, tagName) {
-  return event.tags.find((t) => t[0] === tagName)?.[1] || null;
+export async function fetchFolderFiles(folderId, ownerPubkey = null) {
+  const effectiveOwner = ownerPubkey || await window.nostr.getPublicKey();
+  return fetchFilesInFolder(effectiveOwner, folderId);
 }
 
-export function getAllTagValues(event, tagName) {
-  return event.tags.filter((t) => t[0] === tagName).map((t) => t[1]).filter(Boolean);
+export async function fetchFolderShareEvents(folderId, ownerPubkey = null) {
+  return fetchFolderShares({ folderId, ownerPubkey });
 }
 
-export function getAccessKeyForRecipient(shareEvent, recipientPubkey) {
-  const normalized = normalizePubkey(recipientPubkey);
-  const match = shareEvent.tags.find((t) => t[0] === "access_key" && normalizePubkey(t[1]) === normalized);
-  return match?.[2] || null;
-}
+export async function fetchSharedFoldersForRecipient(recipientPubkey) {
+  const shares = await fetchFolderShares({ recipientPubkey });
+  const deduped = new Map();
 
-function toSharedFileItem(shareEvent, metadataEvent) {
-  const blobHash = getTagValue(shareEvent, "file");
-  const mimeType = metadataEvent ? getTagValue(metadataEvent, "m") : null;
-  const fileName = metadataEvent ? getTagValue(metadataEvent, "name") : null;
-  const sizeValue = metadataEvent ? getTagValue(metadataEvent, "size") : null;
+  for (const share of shares) {
+    const folderId = getTagValue(share, "folder") || getTagValue(share, "d");
+    if (!folderId) continue;
 
-  return {
-    shareEventId: shareEvent.id,
-    blobHash,
-    senderPubkey: shareEvent.pubkey,
-    sharedAt: shareEvent.created_at,
-    allowlistedPubkeys: getAllTagValues(shareEvent, "p"),
-    fileName: fileName || `shared-${(blobHash || "file").slice(0, 12)}`,
-    mimeType: mimeType || "application/octet-stream",
-    size: sizeValue ? Number.parseInt(sizeValue, 10) : null,
-  };
-}
-
-/**
- * Fetch files shared with a recipient pubkey (historical list)
- * @param {string} recipientPubkey - Recipient pubkey (hex or npub)
- * @param {number} limit - Maximum number of recent shared files
- * @returns {Promise<Array>} Shared file items enriched with metadata
- */
-export async function fetchSharedFilesForRecipient(recipientPubkey, limit = 50) {
-  const shares = await fetchSharesForUser(recipientPubkey);
-
-  if (!shares.length) return [];
-
-  shares.sort((a, b) => b.created_at - a.created_at);
-  const recentShares = shares.slice(0, limit);
-
-  const dedupedByBlob = new Map();
-  for (const event of recentShares) {
-    const hash = getTagValue(event, "file");
-    if (!hash || dedupedByBlob.has(hash)) continue;
-    dedupedByBlob.set(hash, event);
+    const key = `${share.pubkey}:${folderId}`;
+    const existing = deduped.get(key);
+    if (isEventNewer(share, existing)) {
+      deduped.set(key, share);
+    }
   }
 
-  const items = await Promise.all(
-    [...dedupedByBlob.values()].map(async (shareEvent) => {
-      const blobHash = getTagValue(shareEvent, "file");
-      const metadataEvent = blobHash ? await fetchFileMetadataByHash(blobHash) : null;
-      return toSharedFileItem(shareEvent, metadataEvent);
-    }),
-  );
-
-  return items.filter((item) => !!item.blobHash);
+  return [...deduped.values()].sort(compareEventsNewestFirst);
 }
 
-/**
- * Subscribe to new share events for a recipient pubkey in real time
- * @param {string} recipientPubkey - Recipient pubkey (hex or npub)
- * @param {{onEvent?: Function, onError?: Function}} handlers - Event callbacks
- * @returns {Function} Unsubscribe function
- */
-export function subscribeToSharesForRecipient(recipientPubkey, handlers = {}, options = {}) {
+export async function fetchUserProfile(pubkey) {
+  const normalizedPubkey = normalizePubkey(pubkey);
+  const events = await fetchEvents({
+    kinds: [0], // kind 0 = user metadata
+    authors: [normalizedPubkey],
+    limit: 1,
+  });
+
+  if (!events.length) return null;
+  
+  try {
+    const metadataEvent = events[0];
+    const metadata = JSON.parse(metadataEvent.content);
+    return {
+      pubkey: normalizedPubkey,
+      name: metadata.name || null,
+      display_name: metadata.display_name || null,
+      picture: metadata.picture || null,
+    };
+  } catch (error) {
+    console.warn(`Failed to parse profile metadata for ${normalizedPubkey}:`, error);
+    return null;
+  }
+}
+
+export function subscribeToFolderSharesForRecipient(recipientPubkey, handlers = {}, options = {}) {
   const { onEvent, onError } = handlers;
   const { sinceSecondsAgo = 300 } = options;
   const normalizedPubkey = normalizePubkey(recipientPubkey);
   const relayPool = initRelayPool();
-
   const seenEventIds = new Set();
 
   const sub = relayPool.subscribeMany(
@@ -397,7 +411,6 @@ export function subscribeToSharesForRecipient(recipientPubkey, handlers = {}, op
       {
         kinds: [EVENT_KINDS.SHARE],
         "#p": [normalizedPubkey],
-        // Backfill a small recent window to avoid race conditions around subscription startup.
         since: unixNow() - sinceSecondsAgo,
       },
     ],
@@ -406,30 +419,49 @@ export function subscribeToSharesForRecipient(recipientPubkey, handlers = {}, op
         if (shareEvent.kind !== EVENT_KINDS.SHARE) return;
         if (seenEventIds.has(shareEvent.id)) return;
         seenEventIds.add(shareEvent.id);
-
-        const blobHash = getTagValue(shareEvent, "file");
-        if (!blobHash) return;
-
-        // Enrich share with metadata in background and emit complete item.
-        void (async () => {
-          try {
-            const metadataEvent = await fetchFileMetadataByHash(blobHash);
-            const item = toSharedFileItem(shareEvent, metadataEvent);
-            onEvent?.(item);
-          } catch (error) {
-            onError?.(error);
-          }
-        })();
+        onEvent?.(shareEvent);
       },
       onclose: (reasons) => {
         if (reasons?.length) {
-          onError?.(new Error(`Share subscription closed: ${reasons.join(", ")}`));
+          onError?.(new Error(`Folder share subscription closed: ${reasons.join(", ")}`));
         }
       },
     },
   );
 
   return () => sub.close();
+}
+
+export function getTagValue(event, tagName) {
+  return event.tags.find((tag) => tag[0] === tagName)?.[1] || null;
+}
+
+export function getAllTagValues(event, tagName) {
+  return event.tags
+    .filter((tag) => tag[0] === tagName)
+    .map((tag) => tag[1])
+    .filter(Boolean);
+}
+
+export function getAccessKeyForRecipient(shareEvent, recipientPubkey) {
+  const normalizedRecipient = normalizePubkey(recipientPubkey);
+  const match = shareEvent.tags.find(
+    (tag) => tag[0] === "access_key" && normalizePubkey(tag[1]) === normalizedRecipient,
+  );
+  return match?.[2] || null;
+}
+
+export function getFolderAddress(pubkey, folderId) {
+  return `${EVENT_KINDS.FOLDER}:${normalizePubkey(pubkey)}:${folderId}`;
+}
+
+export function getFolderIdFromRef(folderRef) {
+  if (!folderRef) return null;
+  const parts = folderRef.split(":");
+  if (parts.length === 3 && parts[0] === String(EVENT_KINDS.FOLDER)) {
+    return parts[2];
+  }
+  return folderRef;
 }
 
 function hexToBytes(hex) {
@@ -452,6 +484,7 @@ function normalizePubkey(pubkey) {
     }
     return decoded.data;
   }
+
   return pubkey;
 }
 
@@ -470,32 +503,23 @@ function getLocalPrivateKeyBytes() {
   return null;
 }
 
-/**
- * Encrypt data using NIP-44 via window.nostr
- * @param {string} plaintext - Text to encrypt
- * @param {string} recipientPubkey - Recipient pubkey
- * @returns {Promise<string>} NIP-44 encrypted string
- */
 export async function encryptNIP44(plaintext, recipientPubkey) {
   const targetPubkey = normalizePubkey(recipientPubkey);
 
-  // Preferred: NIP-07 extension encryption (widely supported API shape)
   if (window.nostr?.nip44?.encrypt) {
     return window.nostr.nip44.encrypt(targetPubkey, plaintext);
   }
 
-  // Compatibility: some providers expose async-suffixed methods
   if (window.nostr?.nip44?.encryptAsync) {
     return window.nostr.nip44.encryptAsync(targetPubkey, plaintext);
   }
 
-  // Fallback: nostr-tools NIP-44 with locally provided private key
   const nip44 = window.NostrTools?.nip44;
   if (nip44?.v2?.utils?.getConversationKey && nip44?.v2?.encrypt) {
     const privateKey = getLocalPrivateKeyBytes();
     if (!privateKey) {
       throw new Error(
-        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback."
+        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback.",
       );
     }
 
@@ -506,12 +530,6 @@ export async function encryptNIP44(plaintext, recipientPubkey) {
   throw new Error("NIP-44 encryption unavailable: extension and nostr-tools fallback are both unavailable");
 }
 
-/**
- * Decrypt data using NIP-44 via window.nostr
- * @param {string} ciphertext - NIP-44 encrypted string
- * @param {string} senderPubkey - Sender pubkey
- * @returns {Promise<string>} Plaintext
- */
 export async function decryptNIP44(ciphertext, senderPubkey) {
   const sourcePubkey = normalizePubkey(senderPubkey);
 
@@ -528,7 +546,7 @@ export async function decryptNIP44(ciphertext, senderPubkey) {
     const privateKey = getLocalPrivateKeyBytes();
     if (!privateKey) {
       throw new Error(
-        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback."
+        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback.",
       );
     }
 

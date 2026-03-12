@@ -89,3 +89,16 @@ export async function downloadBlob(hash) {
   const arrayBuffer = await res.arrayBuffer();
   return new Uint8Array(arrayBuffer);
 }
+
+/**
+ * Delete encrypted blob from Blossom server
+ * @param {string} hash - SHA256 hash of blob (hex)
+ * @returns {Promise<boolean>} True if deletion succeeded
+ */
+export async function deleteBlob(hash) {
+  const blossomUrl = getBlossomUrl();
+  const url = `${blossomUrl}/${hash}`;
+
+  const res = await fetch(url, { method: "DELETE" });
+  return res.ok;
+}

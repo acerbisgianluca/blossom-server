@@ -38,8 +38,6 @@ export class BlossomApp extends LitElement {
   }
 
   getSelectedMode() {
-    if (location.hash === "#view") return "download";
-    if (location.hash === "#uploads") return "uploads";
     if (location.hash === "#shared") return "shared";
     return "upload";
   }
@@ -66,22 +64,6 @@ export class BlossomApp extends LitElement {
                   : "text-green-400 hover:bg-green-950"}"
               >
                 Upload
-              </a>
-              <a
-                href="#view"
-                class="rounded-lg px-3 py-2 text-sm font-medium transition ${mode === "download"
-                  ? "bg-green-500 text-black"
-                  : "text-green-400 hover:bg-green-950"}"
-              >
-                View by Hash
-              </a>
-              <a
-                href="#uploads"
-                class="rounded-lg px-3 py-2 text-sm font-medium transition ${mode === "uploads"
-                  ? "bg-green-500 text-black"
-                  : "text-green-400 hover:bg-green-950"}"
-              >
-                My Uploads
               </a>
               <a
                 href="#shared"

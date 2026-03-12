@@ -10,59 +10,121 @@ blossom-server is a Typescript implementation of a [Blossom Server](https://gith
 - [x] BUD-04
 - [x] BUD-05
 - [x] BUD-06
-- [ ] BUD-08
 
-## Running with npx
+## Encrypted Drive (Browser Client)
 
-This app is also packaged as an npm module which you can easily run
+A client-side encrypted folder sharing system built on Nostr and Blossom.
 
-```sh
-# copy the example config
-wget https://raw.githubusercontent.com/hzrd149/blossom-server/master/config.example.yml -O config.yml
-# run using npx
-npx blossom-server-ts
+### Features
+
+- **Encrypted folders** — each folder has its own Folder Access Key
+- **Per-file AES-256-GCM encryption** — each file still gets a unique File Data Key
+- **Encrypted blob storage** — only encrypted blobs are uploaded to Blossom
+- **Folder-level sharing** — recipients decrypt one folder key and can open all files in that folder
+- **Folder-level revocation and rotation** — rewrap file keys with a new folder key without reuploading blobs
+- **Folder browser UI** — browse owned folders, shared folders, and files inside each folder
+
+### Architecture
+
+The current key hierarchy is:
+
+```text
+file_data --AES-256-GCM--> FDK
+FDK --AES-256-GCM--> FAK_folder
+FAK_folder --NIP-44--> recipients
 ```
 
-## Running with docker
+Definitions:
 
-An example config file can be found [here](./config.example.yml)
+- **FDK** — random 32 byte File Data Key generated per file
+- **FAK_folder** — random 32 byte Folder Access Key generated per folder
 
-```sh
-# create data volume
-docker volume create blossom_data
-# run container
-docker run -v blossom_data:/app/data -v $(pwd)/config.yml:/app/config.yml -p 3000:3000 ghcr.io/hzrd149/blossom-server:master
+Recipients decrypt the folder key once and then use it to unwrap each file's FDK.
+
+### Nostr Event Types
+
+- **Kind 30000 (Folder)** — parameterized replaceable folder definition
+  Tags: `[["d", "<folder_id>"], ["name", "<folder_name>"]]`
+- **Kind 1063 (File Metadata, NIP-94)** — one event per encrypted file
+  Tags: `[["x", "<blob_sha256>"], ["url", "<blossom_url>"], ["m", "<mime_type>"], ["size", "<file_size>"], ["folder", "<folder_id>"], ["wrapped_fdk", "<base64_wrapped_key>"], ["enc", "aes-256-gcm"]]`
+- **Kind 30001 (Folder Share)** — parameterized replaceable share event per folder
+  Tags: `[["d", "<folder_id>"], ["folder", "<folder_id>"]]`, repeated `[["p", "<recipient_pubkey>"]]`, repeated `[["access_key", "<recipient_pubkey>", "<nip44_encrypted_folder_key>"]]`
+
+### Upload Flow
+
+```text
+create or select folder
+generate FAK_folder if folder is new
+
+for each file:
+  generate FDK
+  encrypt file with FDK
+  wrap FDK with FAK_folder
+  upload encrypted blob to Blossom
+  publish file metadata event with folder_id + wrapped_fdk
 ```
 
-You can also run it using docker compose with the [`docker-compose.yml`](./docker-compose.yml) file
+If no owned folder is selected, the UI automatically creates a folder named after the upload batch.
 
-## Running from source
+### Download Flow
 
-This project uses [pnpm](https://pnpm.io/) to manage dependencies. It needs to be installed first in order to build the app
-
-Next clone the repo, install the dependencies, and build
-
-```sh
-git clone https://github.com/hzrd149/blossom-server.git
-cd blossom-server
-pnpm install
-cd admin && pnpm install && cd ../
-pnpm build
+```text
+fetch file metadata
+read folder_id and wrapped_fdk
+fetch folder share event for current user
+decrypt FAK_folder with NIP-44
+unwrap FDK
+download encrypted blob from Blossom
+decrypt file locally
 ```
 
-Next copy the config and modify it
+### Rotation And Revocation
 
-```sh
-cp config.example.yml config.yml
-nano config.yml
-```
+Revocation and rotation now happen at the folder level.
 
-And finally start the app
+When revoking a user or rotating a folder key:
 
-```sh
-pnpm start
-# or
-node .
-```
+1. Fetch all files in the folder
+2. Decrypt each file's wrapped FDK using the current folder key
+3. Generate a new folder key
+4. Rewrap every FDK with the new folder key
+5. Publish fresh file metadata events with updated `wrapped_fdk`
+6. Publish a new folder share event for the remaining recipients
 
-Once the server is running you can open `http://localhost:3000` to access the server
+Encrypted blobs are never reuploaded during rotation or revocation.
+
+### Browser UI
+
+The drive UI is now folder-centric.
+
+1. Navigate to `http://localhost:3000/#drive`
+2. Connect a Nostr extension (e.g. nos2x, Alby, any NIP-07 compatible signer)
+3. Use the left sidebar to browse:
+   - **Folders** — folders you own
+   - **Shared With Me** — folders shared by other users
+4. Use the main panel to:
+   - create folders
+   - upload multiple files into a folder
+   - inspect folder details
+   - share or revoke folder access
+   - rotate folder keys
+   - browse and download files in the selected folder
+
+### Dependencies
+
+- `window.nostr` — NIP-07 signer interface for event signing and NIP-44 encryption/decryption
+- `nostr-tools` — Relay pool and event utilities (loaded via ESM in HTML)
+- **WebCrypto API** — Native browser AES-256-GCM encryption (no external crypto library required)
+
+### Security Assumptions
+
+- **Client-side encryption only** — server never sees plaintext or unencrypted keys
+- **NIP-44 encryption** — assumes extension supports modern NIP-44 (v2) encryption
+- **Trusted relay** — relies on relays for event availability; consider running your own relays for privacy
+- **No local key storage** — file keys stored only on Nostr as encrypted shares (recoverable by owner)
+
+### Limitations
+
+- **Folder-level encryption** — folders themselves are not encrypted; file-only encryption supported in v1
+- **Browser-only** — no Node.js/CLI support in v1
+- **No key rotation** — once encrypted, file keys cannot be rotated without re-uploading

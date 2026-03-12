@@ -6,8 +6,9 @@
 
 export const RELAYS = [
   "wss://relay.damus.io",
-  "wss://relay.nostr.band",
   "wss://nos.lol",
+  "wss://nostr.mom",
+  "wss://nostr.oxtr.dev",
 ];
 
 /**
@@ -21,7 +22,7 @@ export function getBlossomUrl() {
 }
 
 export const EVENT_KINDS = {
-  FOLDER: 50000,        // Replaceable, per pubkey + folder_id
+  FOLDER: 30000,        // Parameterized replaceable folder definition
   FILE_METADATA: 1063,  // NIP-94 media event
-  SHARE: 30001,         // Parameterized replaceable share event per file
+  SHARE: 30001,         // Parameterized replaceable share event per folder
 };

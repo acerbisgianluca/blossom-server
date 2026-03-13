@@ -101,15 +101,26 @@ export async function fetchEvents(filter, timeoutMs = 5000) {
   return events || [];
 }
 
-export async function publishFolderEvent(folderId, folderName) {
+export async function publishFolderEvent(folderId, folderName, options = {}) {
+  const { price = null, zap = null } = options;
+  const tags = [
+    ["d", folderId],
+    ["name", folderName],
+  ];
+
+  if (price != null && Number.isFinite(Number(price)) && Number(price) > 0) {
+    tags.push(["price", String(Math.trunc(Number(price)))]);
+  }
+
+  if (zap) {
+    tags.push(["zap", String(zap)]);
+  }
+
   const result = await publishEvent({
     kind: EVENT_KINDS.FOLDER,
     content: "",
     created_at: unixNow(),
-    tags: [
-      ["d", folderId],
-      ["name", folderName],
-    ],
+    tags,
   });
 
   return result.id;
@@ -178,28 +189,75 @@ export async function publishDeletionEvent(eventId, reason = "") {
 }
 
 export async function publishFolderShare(shareData) {
-  const { createdAt, folderId, recipients, version } = shareData;
-  const uniqueRecipients = [...new Set((recipients || []).map((item) => normalizePubkey(item.pubkey)))];
-  const accessByRecipient = new Map(
-    (recipients || []).map((item) => [normalizePubkey(item.pubkey), item.encryptedFolderKey]),
-  );
+  const { createdAt, folderId, recipients, ownerPubkey } = shareData;
 
   if (!folderId) {
     throw new Error("Missing folder id for folder share event");
   }
 
-  if (uniqueRecipients.length === 0) {
+  if (!Array.isArray(recipients) || recipients.length === 0) {
     throw new Error("Cannot publish folder share event without recipients");
   }
 
-  const tags = [["d", folderId], ["folder", folderId], ["version", String(version || 1)]];
-  for (const recipient of uniqueRecipients) {
-    tags.push(["p", recipient]);
-    const encryptedFolderKey = accessByRecipient.get(recipient);
-    if (!encryptedFolderKey) {
-      throw new Error(`Missing encrypted folder key for recipient ${recipient}`);
-    }
-    tags.push(["access_key", recipient, encryptedFolderKey]);
+  const owner = normalizePubkey(ownerPubkey || await window.nostr.getPublicKey());
+  const published = [];
+  for (const entry of recipients) {
+    const recipient = normalizePubkey(entry?.pubkey);
+    const encryptedFolderKey = entry?.encryptedFolderKey;
+    if (!recipient || !encryptedFolderKey) continue;
+
+    const id = await publishShareEvent({
+      folderId,
+      ownerPubkey: owner,
+      recipientPubkey: recipient,
+      encryptedKey: encryptedFolderKey,
+      createdAt,
+    });
+    published.push(id);
+  }
+
+  if (published.length === 0) {
+    throw new Error("No valid recipients for folder share publish");
+  }
+
+  return published[0];
+}
+
+export async function publishShareEvent(shareData) {
+  const {
+    createdAt,
+    folderId,
+    ownerPubkey,
+    payment,
+    recipientPubkey,
+    encryptedKey,
+  } = shareData;
+
+  const recipient = normalizePubkey(recipientPubkey);
+  const owner = normalizePubkey(ownerPubkey || await window.nostr.getPublicKey());
+
+  if (!folderId) {
+    throw new Error("Missing folder id for share event");
+  }
+  if (!recipient) {
+    throw new Error("Missing recipient pubkey for share event");
+  }
+  if (!encryptedKey) {
+    throw new Error("Missing encrypted folder key for share event");
+  }
+
+  const folderAddress = getFolderAddress(owner, folderId);
+  const dTag = getShareDTag(folderId, recipient);
+
+  const tags = [
+    ["d", dTag],
+    ["a", folderAddress],
+    ["p", recipient],
+    ["key", encryptedKey],
+  ];
+
+  if (payment) {
+    tags.push(["payment", payment]);
   }
 
   const result = await publishEvent({
@@ -232,6 +290,28 @@ export async function fetchUserFolders(pubkey) {
   }
 
   return [...latestByFolderId.values()].sort(compareEventsNewestFirst);
+}
+
+export async function fetchPaidFolders(limit = 300) {
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.FOLDER],
+    limit,
+  });
+
+  const latestByFolderAddress = new Map();
+  for (const event of events) {
+    const folderId = getTagValue(event, "d");
+    const price = getTagValue(event, "price");
+    if (!folderId || !price) continue;
+
+    const folderAddress = getFolderAddress(event.pubkey, folderId);
+    const existing = latestByFolderAddress.get(folderAddress);
+    if (isEventNewer(event, existing)) {
+      latestByFolderAddress.set(folderAddress, event);
+    }
+  }
+
+  return [...latestByFolderAddress.values()].sort(compareEventsNewestFirst);
 }
 
 export async function fetchFilesInFolder(ownerPubkey, folderId) {
@@ -269,42 +349,43 @@ export async function fetchFilesInFolder(ownerPubkey, folderId) {
 }
 
 export async function fetchFolderShares({ recipientPubkey = null, folderId = null, ownerPubkey = null } = {}) {
+  if (folderId && ownerPubkey) {
+    const address = getFolderAddress(ownerPubkey, folderId);
+    const events = await fetchShareEventsForFolder(address);
+    if (!recipientPubkey) {
+      return events;
+    }
+
+    const target = normalizePubkey(recipientPubkey);
+    return events.filter((event) => normalizePubkey(getTagValue(event, "p")) === target);
+  }
+
+  if (recipientPubkey && !folderId) {
+    return fetchShareEventsForUser(recipientPubkey);
+  }
+
   const filter = {
     kinds: [EVENT_KINDS.SHARE],
-    limit: 300,
+    limit: 500,
   };
-
-  if (recipientPubkey) {
-    filter["#p"] = [normalizePubkey(recipientPubkey)];
-  }
 
   if (ownerPubkey) {
     filter.authors = [normalizePubkey(ownerPubkey)];
   }
+  if (recipientPubkey) {
+    filter["#p"] = [normalizePubkey(recipientPubkey)];
+  }
 
   let events = await fetchEvents(filter);
-
-  if (!events.length && ownerPubkey) {
-    events = await fetchEvents({
-      kinds: [EVENT_KINDS.SHARE],
-      authors: [normalizePubkey(ownerPubkey)],
-      limit: 300,
-    });
-  }
-
   if (folderId) {
-    events = events.filter((event) => {
-      const dTag = getTagValue(event, "d");
-      const folderTag = getTagValue(event, "folder");
-      return dTag === folderId || folderTag === folderId;
-    });
+    events = events.filter((event) => getFolderIdFromShareEvent(event) === folderId);
   }
 
-  return events.sort(compareEventsNewestFirst);
+  return dedupeShareEvents(events);
 }
 
-export async function fetchLatestFolderShare(folderId, ownerPubkey = null) {
-  const events = await fetchFolderShares({ folderId, ownerPubkey });
+export async function fetchLatestFolderShare(folderId, ownerPubkey = null, recipientPubkey = null) {
+  const events = await fetchFolderShares({ folderId, ownerPubkey, recipientPubkey });
   return events[0] || null;
 }
 
@@ -356,14 +437,15 @@ export async function fetchFolderShareEvents(folderId, ownerPubkey = null) {
 }
 
 export async function fetchSharedFoldersForRecipient(recipientPubkey) {
-  const shares = await fetchFolderShares({ recipientPubkey });
+  const shares = await fetchShareEventsForUser(recipientPubkey);
   const deduped = new Map();
 
   for (const share of shares) {
-    const folderId = getTagValue(share, "folder") || getTagValue(share, "d");
+    const folderAddress = getTagValue(share, "a") || null;
+    const folderId = getFolderIdFromShareEvent(share);
     if (!folderId) continue;
 
-    const key = `${share.pubkey}:${folderId}`;
+    const key = folderAddress || `${share.pubkey}:${folderId}`;
     const existing = deduped.get(key);
     if (isEventNewer(share, existing)) {
       deduped.set(key, share);
@@ -445,10 +527,263 @@ export function getAllTagValues(event, tagName) {
 
 export function getAccessKeyForRecipient(shareEvent, recipientPubkey) {
   const normalizedRecipient = normalizePubkey(recipientPubkey);
+
+  const eventRecipient = normalizePubkey(getTagValue(shareEvent, "p"));
+  if (eventRecipient === normalizedRecipient) {
+    const keyTag = shareEvent.tags.find((tag) => tag[0] === "key" && tag[1]);
+    if (keyTag?.[1]) return keyTag[1];
+  }
+
+  const keyByRecipientTag = shareEvent.tags.find(
+    (tag) => tag[0]?.startsWith("key:") && normalizePubkey(tag[0].slice(4)) === normalizedRecipient,
+  );
+  if (keyByRecipientTag?.[1]) return keyByRecipientTag[1];
+
   const match = shareEvent.tags.find(
     (tag) => tag[0] === "access_key" && normalizePubkey(tag[1]) === normalizedRecipient,
   );
   return match?.[2] || null;
+}
+
+export function buildFolderAddress(folderEvent) {
+  const folderId = getTagValue(folderEvent, "d");
+  if (!folderId || !folderEvent?.pubkey) {
+    throw new Error("Cannot build folder address from folder event");
+  }
+  return getFolderAddress(folderEvent.pubkey, folderId);
+}
+
+function parseFolderAddress(folderAddress) {
+  const parts = (folderAddress || "").split(":");
+  if (parts.length !== 3) return null;
+  if (parts[0] !== String(EVENT_KINDS.FOLDER)) return null;
+  return {
+    ownerPubkey: normalizePubkey(parts[1]),
+    folderId: parts[2],
+  };
+}
+
+function getShareDTag(folderId, recipientPubkey) {
+  return `${folderId}:${normalizePubkey(recipientPubkey)}`;
+}
+
+function parseShareDTag(dTag) {
+  const separatorIndex = (dTag || "").lastIndexOf(":");
+  if (separatorIndex <= 0) return null;
+
+  const folderId = dTag.slice(0, separatorIndex);
+  const recipientPubkey = dTag.slice(separatorIndex + 1);
+  if (!folderId || !recipientPubkey) return null;
+
+  return {
+    folderId,
+    recipientPubkey: normalizePubkey(recipientPubkey),
+  };
+}
+
+function getFolderIdFromShareEvent(shareEvent) {
+  const address = parseFolderAddress(getTagValue(shareEvent, "a"));
+  if (address?.folderId) return address.folderId;
+
+  const parsedDTag = parseShareDTag(getTagValue(shareEvent, "d"));
+  if (parsedDTag?.folderId) return parsedDTag.folderId;
+
+  return getTagValue(shareEvent, "folder") || getTagValue(shareEvent, "d") || null;
+}
+
+function getShareIdentityKey(shareEvent) {
+  const folderId = getFolderIdFromShareEvent(shareEvent);
+  const recipient = normalizePubkey(getTagValue(shareEvent, "p") || "");
+
+  const parsedAddress = parseFolderAddress(getTagValue(shareEvent, "a"));
+  const owner = parsedAddress?.ownerPubkey || normalizePubkey(shareEvent.pubkey);
+
+  if (!folderId || !recipient || !owner) {
+    return null;
+  }
+
+  return `${owner}:${folderId}:${recipient}`;
+}
+
+function dedupeShareEvents(events) {
+  const byIdentity = new Map();
+  for (const event of events || []) {
+    const key = getShareIdentityKey(event);
+    if (!key) continue;
+    const existing = byIdentity.get(key);
+    if (isEventNewer(event, existing)) {
+      byIdentity.set(key, event);
+    }
+  }
+  return [...byIdentity.values()].sort(compareEventsNewestFirst);
+}
+
+function extractLegacyAccessKeys(shareEvent) {
+  const recipients = getAllTagValues(shareEvent, "p").map((value) => normalizePubkey(value));
+  const recipientSet = new Set(recipients);
+  const keysByRecipient = new Map();
+
+  for (const tag of shareEvent.tags || []) {
+    if (!Array.isArray(tag) || tag.length < 2) continue;
+
+    if (tag[0] === "access_key" && tag[1] && tag[2]) {
+      keysByRecipient.set(normalizePubkey(tag[1]), tag[2]);
+      recipientSet.add(normalizePubkey(tag[1]));
+      continue;
+    }
+
+    if (tag[0].startsWith("key:") && tag[1]) {
+      const recipient = normalizePubkey(tag[0].slice(4));
+      keysByRecipient.set(recipient, tag[1]);
+      recipientSet.add(recipient);
+    }
+  }
+
+  // Legacy fallback: single key with single recipient.
+  const keyTag = (shareEvent.tags || []).find((tag) => tag[0] === "key" && tag[1]);
+  if (keyTag && recipients.length === 1 && !keysByRecipient.get(recipients[0])) {
+    keysByRecipient.set(recipients[0], keyTag[1]);
+  }
+
+  return [...recipientSet]
+    .map((recipient) => ({ recipient, encryptedKey: keysByRecipient.get(recipient) || null }))
+    .filter((entry) => entry.recipient && entry.encryptedKey);
+}
+
+function isLegacyAclShareEvent(shareEvent) {
+  const addressTag = getTagValue(shareEvent, "a");
+  if (addressTag) return false;
+
+  const dTag = getTagValue(shareEvent, "d") || "";
+  if (parseShareDTag(dTag)) return false;
+
+  const recipientCount = getAllTagValues(shareEvent, "p").length;
+  const hasAccessKeyTag = (shareEvent.tags || []).some((tag) => tag[0] === "access_key");
+  const hasRecipientKeyTag = (shareEvent.tags || []).some((tag) => tag[0]?.startsWith("key:"));
+  const hasPlainKeyTag = (shareEvent.tags || []).some((tag) => tag[0] === "key" && tag[1]);
+  return recipientCount > 1 || hasAccessKeyTag || hasRecipientKeyTag || (recipientCount === 1 && hasPlainKeyTag);
+}
+
+async function migrateLegacyShareEvent(legacyEvent, ownerPubkey, folderId) {
+  const entries = extractLegacyAccessKeys(legacyEvent);
+  if (entries.length === 0) return 0;
+
+  let published = 0;
+  for (const entry of entries) {
+    await publishShareEvent({
+      folderId,
+      ownerPubkey,
+      recipientPubkey: entry.recipient,
+      encryptedKey: entry.encryptedKey,
+      createdAt: (legacyEvent.created_at || unixNow()) + 1,
+    });
+    published += 1;
+  }
+
+  await publishDeletionEvent(legacyEvent.id, "migrated legacy ACL share event");
+  return published;
+}
+
+export async function fetchShareEventsForFolder(folderAddress) {
+  const parsedAddress = parseFolderAddress(folderAddress);
+  if (!parsedAddress) {
+    throw new Error("Invalid folder address");
+  }
+
+  const { ownerPubkey, folderId } = parsedAddress;
+  let events = await fetchEvents({
+    kinds: [EVENT_KINDS.SHARE],
+    "#a": [folderAddress],
+    authors: [ownerPubkey],
+    limit: 500,
+  });
+
+  // Relays may miss #a indexing; fallback to author-scan and local filtering.
+  if (!events.length) {
+    const scanned = await fetchEvents({
+      kinds: [EVENT_KINDS.SHARE],
+      authors: [ownerPubkey],
+      limit: 500,
+    });
+
+    events = scanned.filter((event) => {
+      const eventFolderId = getFolderIdFromShareEvent(event);
+      const eventAddress = getTagValue(event, "a");
+      return eventFolderId === folderId || eventAddress === folderAddress;
+    });
+  }
+
+  const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
+  const legacyEvents = events.filter((event) => isLegacyAclShareEvent(event));
+  for (const legacyEvent of legacyEvents) {
+    // Only the original author can publish valid replacements/deletions.
+    if (normalizePubkey(legacyEvent.pubkey) !== myPubkey) continue;
+    await migrateLegacyShareEvent(legacyEvent, ownerPubkey, folderId);
+  }
+
+  if (legacyEvents.length > 0) {
+    events = await fetchEvents({
+      kinds: [EVENT_KINDS.SHARE],
+      "#a": [folderAddress],
+      authors: [ownerPubkey],
+      limit: 500,
+    });
+
+    if (!events.length) {
+      const scanned = await fetchEvents({
+        kinds: [EVENT_KINDS.SHARE],
+        authors: [ownerPubkey],
+        limit: 500,
+      });
+      events = scanned.filter((event) => getTagValue(event, "a") === folderAddress);
+    }
+  }
+
+  const canonical = events.filter((event) => {
+    const recipient = getTagValue(event, "p");
+    const encryptedKey = getTagValue(event, "key");
+    return getTagValue(event, "a") === folderAddress && recipient && encryptedKey;
+  });
+
+  return dedupeShareEvents(canonical);
+}
+
+export async function fetchShareEventsForUser(pubkey) {
+  const normalizedPubkey = normalizePubkey(pubkey);
+  const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.SHARE],
+    "#p": [normalizedPubkey],
+    limit: 500,
+  });
+
+  const legacyEvents = events.filter((event) => isLegacyAclShareEvent(event));
+  for (const legacyEvent of legacyEvents) {
+    if (normalizePubkey(legacyEvent.pubkey) !== myPubkey) continue;
+    const folderId = getFolderIdFromShareEvent(legacyEvent);
+    if (!folderId) continue;
+    await migrateLegacyShareEvent(legacyEvent, normalizePubkey(legacyEvent.pubkey), folderId);
+  }
+
+  let latest = events;
+  if (legacyEvents.length > 0) {
+    latest = await fetchEvents({
+      kinds: [EVENT_KINDS.SHARE],
+      "#p": [normalizedPubkey],
+      limit: 500,
+    });
+  }
+
+  const canonical = latest.filter((event) => {
+    const eventRecipient = normalizePubkey(getTagValue(event, "p") || "");
+    return eventRecipient === normalizedPubkey && !!getTagValue(event, "a") && !!getTagValue(event, "key");
+  });
+
+  return dedupeShareEvents(canonical);
+}
+
+export async function publishDeletion(eventId, reason = "") {
+  return publishDeletionEvent(eventId, reason);
 }
 
 export function getFolderAddress(pubkey, folderId) {

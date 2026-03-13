@@ -12,10 +12,13 @@ import {
   getFolderRecipients,
   listFiles,
   listFolders,
+  listLockedFolders,
   listSharedWithMe,
   revokeUser,
   rotateFolderKey,
   shareFolder,
+  startFolderPaymentListener,
+  unlockFolder,
   uploadFiles,
 } from "./drive/drive.js";
 import { subscribeToFolderSharesForRecipient, fetchUserProfile } from "./drive/nostr.js";
@@ -46,6 +49,7 @@ export class DriveForm extends LitElement {
     myPubkey: { state: true, type: String },
     ownedFolders: { state: true },
     sharedFolders: { state: true },
+    lockedFolders: { state: true },
     selectedFolder: { state: true },
     folderFiles: { state: true },
     filesLoading: { state: true, type: Boolean },
@@ -54,6 +58,8 @@ export class DriveForm extends LitElement {
     uploadProgress: { state: true },
     createFolderOpen: { state: true, type: Boolean },
     createFolderName: { state: true, type: String },
+    createFolderPriceMsats: { state: true, type: String },
+    createFolderZapTarget: { state: true, type: String },
     createFolderRecipients: { state: true },
     createFolderRecipientInput: { state: true, type: String },
     selectedFolderRecipients: { state: true },
@@ -75,6 +81,7 @@ export class DriveForm extends LitElement {
     this.myPubkey = "";
     this.ownedFolders = [];
     this.sharedFolders = [];
+    this.lockedFolders = [];
     this.selectedFolder = null;
     this.folderFiles = [];
     this.filesLoading = false;
@@ -83,6 +90,8 @@ export class DriveForm extends LitElement {
     this.uploadProgress = {};
     this.createFolderOpen = false;
     this.createFolderName = "";
+    this.createFolderPriceMsats = "";
+    this.createFolderZapTarget = "";
     this.createFolderRecipients = [];
     this.createFolderRecipientInput = "";
     this.selectedFolderRecipients = [];
@@ -90,6 +99,7 @@ export class DriveForm extends LitElement {
     this.sharedPanelOpen = false;
     this.sharedUnreadCount = 0;
     this._shareSubscriptionClose = null;
+    this._paymentSubscriptionClose = null;
     this._isDestroyed = false;
     this._profileCache = {}; // Cache for user profiles
   }
@@ -112,6 +122,7 @@ export class DriveForm extends LitElement {
     }
     await this.refreshSidebarData();
     this.startShareSubscription();
+    this.startPaymentSubscription();
   }
 
   disconnectedCallback() {
@@ -121,16 +132,20 @@ export class DriveForm extends LitElement {
       this._shareSubscriptionClose();
       this._shareSubscriptionClose = null;
     }
+    if (this._paymentSubscriptionClose) {
+      this._paymentSubscriptionClose();
+      this._paymentSubscriptionClose = null;
+    }
   }
 
   updated(changedProperties) {
     if (changedProperties.has("mode")) {
       if (this.mode === "shared") {
-        if (this.sharedFolders.length > 0) {
-          const preferred = this.sharedFolders[0];
+        if (this.sharedFolders.length > 0 || this.lockedFolders.length > 0) {
+          const preferred = this.sharedFolders[0] || this.lockedFolders[0];
           if (
             !this.selectedFolder
-            || this.selectedFolder.source !== "shared"
+            || (this.selectedFolder.source !== "shared" && this.selectedFolder.source !== "locked")
             || this.selectedFolder.folderId !== preferred.folderId
             || this.selectedFolder.ownerPubkey !== preferred.ownerPubkey
           ) {
@@ -206,16 +221,36 @@ export class DriveForm extends LitElement {
     }, { sinceSecondsAgo: 900 });
   }
 
-  async refreshSharedFoldersOnly() {
-    const sharedFolders = await listSharedWithMe();
-    this.sharedFolders = sharedFolders;
+  startPaymentSubscription() {
+    if (this._paymentSubscriptionClose) {
+      this._paymentSubscriptionClose();
+      this._paymentSubscriptionClose = null;
+    }
 
-    if (this.selectedFolder && this.selectedFolder.source === "shared") {
-      const selected = sharedFolders.find(
+    this._paymentSubscriptionClose = startFolderPaymentListener(this.myPubkey, {
+      onGranted: async () => {
+        await this.refreshSidebarData();
+      },
+      onError: (error) => {
+        console.warn("Folder payment subscription error:", error);
+      },
+    });
+  }
+
+  async refreshSharedFoldersOnly() {
+    const [sharedFolders, lockedFolders] = await Promise.all([
+      listSharedWithMe(),
+      listLockedFolders(),
+    ]);
+    this.sharedFolders = sharedFolders;
+    this.lockedFolders = lockedFolders;
+
+    if (this.selectedFolder && (this.selectedFolder.source === "shared" || this.selectedFolder.source === "locked")) {
+      const selected = [...sharedFolders, ...lockedFolders].find(
         (folder) => folder.folderId === this.selectedFolder.folderId && folder.ownerPubkey === this.selectedFolder.ownerPubkey,
       );
       if (selected) {
-        await this.selectFolder({ ...selected, source: "shared" });
+        await this.selectFolder(selected);
       }
     }
   }
@@ -224,17 +259,21 @@ export class DriveForm extends LitElement {
     this.sidebarLoading = true;
 
     try {
-      const [ownedFolders, sharedFolders] = await Promise.all([
+      const [ownedFolders, sharedFolders, lockedFolders] = await Promise.all([
         listFolders(),
         listSharedWithMe(),
+        listLockedFolders(),
       ]);
 
       this.ownedFolders = ownedFolders.map((folder) => ({ ...folder, source: "owned" }));
       this.sharedFolders = sharedFolders.map((folder) => ({ ...folder, source: "shared" }));
+      this.lockedFolders = lockedFolders.map((folder) => ({ ...folder, source: "locked" }));
 
-      const allFolders = [...this.ownedFolders, ...this.sharedFolders];
+      const allFolders = [...this.ownedFolders, ...this.sharedFolders, ...this.lockedFolders];
       if (!this.selectedFolder && allFolders.length > 0) {
-        const preferred = this.mode === "shared" ? this.sharedFolders[0] || this.ownedFolders[0] : this.ownedFolders[0] || this.sharedFolders[0];
+        const preferred = this.mode === "shared"
+          ? this.sharedFolders[0] || this.lockedFolders[0] || this.ownedFolders[0]
+          : this.ownedFolders[0] || this.sharedFolders[0] || this.lockedFolders[0];
         if (preferred) {
           await this.selectFolder(preferred);
         }
@@ -265,13 +304,19 @@ export class DriveForm extends LitElement {
     this.filesLoading = true;
 
     try {
+      if (folder.locked || folder.source === "locked") {
+        this.folderFiles = [];
+        this.selectedFolderRecipients = [];
+        return;
+      }
+
       const files = await listFiles(folder.folderId, folder.ownerPubkey);
       this.folderFiles = files;
 
-      if (folder.ownerPubkey === this.myPubkey) {
+      if (this.isOwnedFolder(folder)) {
         const recipients = await getFolderRecipients(folder.folderId, folder.ownerPubkey);
         const filteredRecipients = recipients
-          .filter((recipient) => recipient !== this.myPubkey)
+          .filter((recipient) => this.normalizePubkey(recipient) !== this.normalizePubkey(this.myPubkey))
           .map((recipient) => this.toNpub(recipient));
         this.selectedFolderRecipients = [...new Set(filteredRecipients)];
       } else {
@@ -286,6 +331,26 @@ export class DriveForm extends LitElement {
 
   normalizeRecipient(value) {
     return (value || "").trim();
+  }
+
+  normalizePubkey(value) {
+    const input = (value || "").trim();
+    if (!input) return "";
+
+    if (input.startsWith("npub")) {
+      const decoded = window.NostrTools?.nip19?.decode?.(input);
+      if (decoded?.type === "npub" && decoded.data) {
+        return String(decoded.data).toLowerCase();
+      }
+      return "";
+    }
+
+    return input.toLowerCase();
+  }
+
+  isOwnedFolder(folder) {
+    if (!folder) return false;
+    return this.normalizePubkey(folder.ownerPubkey) === this.normalizePubkey(this.myPubkey);
   }
 
   toNpub(pubkey) {
@@ -409,8 +474,21 @@ export class DriveForm extends LitElement {
     try {
       this.error = "";
       this.status = "Creating folder...";
-      const folder = await createFolder(this.createFolderName || "Untitled Folder", this.createFolderRecipients);
+      const priceMsats = Number.parseInt(this.createFolderPriceMsats || "0", 10);
+      const zapTarget = (this.createFolderZapTarget || "").trim();
+      const folderOptions = {
+        price: Number.isFinite(priceMsats) && priceMsats > 0 ? priceMsats : null,
+        zap: zapTarget || null,
+      };
+
+      if (folderOptions.price && !folderOptions.zap) {
+        throw new Error("Paid folders require a zap endpoint/address");
+      }
+
+      const folder = await createFolder(this.createFolderName || "Untitled Folder", this.createFolderRecipients, folderOptions);
       this.createFolderName = "";
+      this.createFolderPriceMsats = "";
+      this.createFolderZapTarget = "";
       this.createFolderRecipients = [];
       this.createFolderRecipientInput = "";
       this.createFolderOpen = false;
@@ -472,7 +550,7 @@ export class DriveForm extends LitElement {
   }
 
   canUploadToSelectedFolder() {
-    return this.selectedFolder && this.selectedFolder.ownerPubkey === this.myPubkey;
+    return this.selectedFolder && this.isOwnedFolder(this.selectedFolder);
   }
 
   async uploadHandler() {
@@ -481,7 +559,7 @@ export class DriveForm extends LitElement {
       return;
     }
 
-    if (this.selectedFolder && this.selectedFolder.ownerPubkey !== this.myPubkey) {
+    if (this.selectedFolder && !this.isOwnedFolder(this.selectedFolder)) {
       this.error = "You can only upload into folders you own";
       return;
     }
@@ -530,7 +608,7 @@ export class DriveForm extends LitElement {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const recipients = await getFolderRecipients(folderId, ownerPubkey);
       const normalized = recipients
-        .filter((recipient) => recipient !== this.myPubkey)
+        .filter((recipient) => this.normalizePubkey(recipient) !== this.normalizePubkey(this.myPubkey))
         .map((recipient) => this.toNpub(recipient))
         .sort();
 
@@ -554,7 +632,7 @@ export class DriveForm extends LitElement {
       this.status = "Updating folder access...";
       const currentRecipients = await getFolderRecipients(this.selectedFolder.folderId, this.selectedFolder.ownerPubkey);
       const currentAsNpub = currentRecipients
-        .filter((recipient) => recipient !== this.myPubkey)
+        .filter((recipient) => this.normalizePubkey(recipient) !== this.normalizePubkey(this.myPubkey))
         .map((recipient) => this.toNpub(recipient));
       const currentRecipientSet = new Set(currentAsNpub);
       const targetRecipientSet = new Set(this.selectedFolderRecipients);
@@ -594,6 +672,27 @@ export class DriveForm extends LitElement {
       await rotateFolderKey(this.selectedFolder.folderId, this.selectedFolder.ownerPubkey);
       await this.selectFolder(this.selectedFolder);
       this.status = "Folder key rotated.";
+    } catch (error) {
+      this.error = error.message;
+      this.status = "";
+    }
+  }
+
+  formatPriceMsats(priceMsats) {
+    const value = Number.parseInt(String(priceMsats || "0"), 10);
+    if (!Number.isFinite(value) || value <= 0) return "free";
+    return `${Math.round(value / 1000)} sats`;
+  }
+
+  async unlockSelectedFolder() {
+    if (!this.selectedFolder || !this.selectedFolder.locked) return;
+
+    try {
+      this.error = "";
+      this.status = `Requesting zap payment for ${this.selectedFolder.folderName}...`;
+      await unlockFolder(this.selectedFolder.folderId, this.selectedFolder.ownerPubkey);
+      this.status = "Payment sent. Waiting for owner receipt verification...";
+      await this.refreshSidebarData();
     } catch (error) {
       this.error = error.message;
       this.status = "";
@@ -672,7 +771,7 @@ export class DriveForm extends LitElement {
 
   async deleteFolderItem(folder) {
     if (!folder) return;
-    if (folder.ownerPubkey !== this.myPubkey) return;
+    if (!this.isOwnedFolder(folder)) return;
 
     const confirmed = window.confirm(`Delete ${folder.folderName} and all files inside?`);
     if (!confirmed) return;
@@ -816,8 +915,10 @@ export class DriveForm extends LitElement {
 
   renderSidebarSection(title, folders) {
     const isSharedSection = title === "Shared With Me";
+    const isLockedSection = title === "Locked Folders";
     const isFoldersSection = title === "Folders";
     if (this.mode === "upload" && isSharedSection) return null;
+    if (this.mode === "upload" && isLockedSection) return null;
     if (this.mode === "shared" && isFoldersSection) return null;
 
     if (this.sidebarLoading) {
@@ -832,7 +933,7 @@ export class DriveForm extends LitElement {
       <div class="space-y-0.5">
         ${folders.map(
           (folder) => {
-            const isOwnedFolder = folder.ownerPubkey === this.myPubkey;
+            const isOwnedFolder = this.isOwnedFolder(folder);
             return html`<div class="flex items-center gap-2">
               <button
                 type="button"
@@ -844,7 +945,11 @@ export class DriveForm extends LitElement {
                   : "hover:bg-green-950/40"}"
               >
                 <div class="truncate text-sm font-medium text-green-300">${folder.folderName}</div>
-                <div class="mt-0.5 text-xs text-green-700">${folder.fileCount} file${folder.fileCount === 1 ? "" : "s"}</div>
+                <div class="mt-0.5 text-xs text-green-700">
+                  ${folder.locked
+                    ? `Locked · ${this.formatPriceMsats(folder.priceMsats)}`
+                    : `${folder.fileCount} file${folder.fileCount === 1 ? "" : "s"}`}
+                </div>
               </button>
               ${isOwnedFolder
                 ? html`<button
@@ -882,6 +987,31 @@ export class DriveForm extends LitElement {
               @input="${(e) => (this.createFolderName = e.target.value)}"
             />
           </label>
+
+          <div class="grid gap-2 sm:grid-cols-2">
+            <label class="block text-xs font-semibold uppercase tracking-wide text-green-600">
+              Price (msats)
+              <input
+                type="number"
+                min="0"
+                step="1000"
+                class="mt-1 block w-full rounded-md border border-green-900 bg-black p-2 text-sm text-green-300"
+                placeholder="0 (free)"
+                .value="${this.createFolderPriceMsats}"
+                @input="${(e) => (this.createFolderPriceMsats = e.target.value)}"
+              />
+            </label>
+            <label class="block text-xs font-semibold uppercase tracking-wide text-green-600">
+              Zap Target
+              <input
+                type="text"
+                class="mt-1 block w-full rounded-md border border-green-900 bg-black p-2 text-sm text-green-300"
+                placeholder="name@domain or https://.../.well-known/lnurlp/name"
+                .value="${this.createFolderZapTarget}"
+                @input="${(e) => (this.createFolderZapTarget = e.target.value)}"
+              />
+            </label>
+          </div>
 
           <label class="text-xs font-semibold uppercase tracking-wide text-green-600">
             Share with (optional)
@@ -930,7 +1060,7 @@ export class DriveForm extends LitElement {
           <div>
             <h3 class="text-sm font-semibold uppercase tracking-[0.18em] text-green-400">Upload Files</h3>
             <p class="text-xs text-green-700">
-              ${this.selectedFolder && this.selectedFolder.ownerPubkey === this.myPubkey
+              ${this.selectedFolder && this.isOwnedFolder(this.selectedFolder)
                 ? `Uploading into ${this.selectedFolder.folderName}`
                 : "No owned folder selected. A new encrypted folder will be created automatically."}
             </p>
@@ -996,7 +1126,7 @@ export class DriveForm extends LitElement {
   }
 
   renderFolderAccessPanel() {
-    if (!this.selectedFolder || this.selectedFolder.ownerPubkey !== this.myPubkey) {
+    if (!this.selectedFolder || !this.isOwnedFolder(this.selectedFolder)) {
       return null;
     }
 
@@ -1052,7 +1182,8 @@ export class DriveForm extends LitElement {
       return null;
     }
 
-    const isOwned = this.selectedFolder.ownerPubkey === this.myPubkey;
+    const isOwned = this.isOwnedFolder(this.selectedFolder);
+    const isLocked = !!this.selectedFolder.locked;
     const recipientCount = isOwned ? this.selectedFolderRecipients.length : null;
     const timestamp = this.selectedFolder.sharedAt || this.selectedFolder.createdAt || null;
 
@@ -1078,11 +1209,15 @@ export class DriveForm extends LitElement {
           </div>
           <div class="rounded-lg border border-green-950 p-3">
             <div class="text-[11px] uppercase tracking-wide text-green-600">Access</div>
-            <div class="mt-1 text-sm text-green-300">${isOwned ? "Owned by you" : "Shared with you"}</div>
+            <div class="mt-1 text-sm text-green-300">${isOwned ? "Owned by you" : isLocked ? "Locked (payment required)" : "Shared with you"}</div>
           </div>
           <div class="rounded-lg border border-green-950 p-3">
             <div class="text-[11px] uppercase tracking-wide text-green-600">Recipients</div>
             <div class="mt-1 text-sm text-green-300">${recipientCount == null ? "Hidden" : recipientCount}</div>
+          </div>
+          <div class="rounded-lg border border-green-950 p-3">
+            <div class="text-[11px] uppercase tracking-wide text-green-600">Price</div>
+            <div class="mt-1 text-sm text-green-300">${this.formatPriceMsats(this.selectedFolder.priceMsats)}</div>
           </div>
           <div class="rounded-lg border border-green-950 p-3 sm:col-span-2">
             <div class="text-[11px] uppercase tracking-wide text-green-600">Timestamp</div>
@@ -1106,7 +1241,25 @@ export class DriveForm extends LitElement {
       return html`<div class="rounded-xl border border-green-900 bg-black p-6 text-sm text-green-600">Loading files…</div>`;
     }
 
-    const isOwnedFolder = this.selectedFolder.ownerPubkey === this.myPubkey;
+    const isOwnedFolder = this.isOwnedFolder(this.selectedFolder);
+    const isLockedFolder = !!this.selectedFolder.locked;
+
+    if (isLockedFolder) {
+      return html`
+        <div class="rounded-xl border border-green-900 bg-black p-5">
+          <div class="mb-3 text-sm text-green-300">
+            This folder is zap-gated. Price: <span class="font-semibold">${this.formatPriceMsats(this.selectedFolder.priceMsats)}</span>
+          </div>
+          <button
+            type="button"
+            @click="${() => this.unlockSelectedFolder()}"
+            class="rounded-md bg-green-500 px-4 py-2 text-sm font-semibold text-black hover:bg-green-400"
+          >
+            Unlock
+          </button>
+        </div>
+      `;
+    }
 
     return html`
       <div class="rounded-xl border border-green-900 bg-black p-4">
@@ -1218,6 +1371,10 @@ export class DriveForm extends LitElement {
             </div>
             <div class="p-2">
               ${this.renderSidebarSection("Shared With Me", this.sharedFolders)}
+              <div class="mt-2 border-t border-green-900 pt-2">
+                <div class="px-1 pb-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-green-700">Locked</div>
+                ${this.renderSidebarSection("Locked Folders", this.lockedFolders)}
+              </div>
             </div>
           </div>`;
 

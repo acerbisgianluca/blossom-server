@@ -6,19 +6,20 @@ import {
   wrapKey,
 } from "./encryption.js";
 import {
+  buildFolderAddress,
   decryptNIP44,
   encryptNIP44,
   fetchFilesInFolder,
   fetchFolder,
+  fetchShareEventsForFolder,
   fetchLatestFolderShare,
   fetchUserFolders,
-  getAccessKeyForRecipient,
-  getAllTagValues,
   getFolderIdFromRef,
   getTagValue,
+  publishDeletion,
   publishFileMetadata,
   publishFolderEvent,
-  publishFolderShare,
+  publishShareEvent,
 } from "./nostr.js";
 
 function normalizePubkey(pubkey) {
@@ -76,48 +77,87 @@ function extractMetadataPayload(metadataEvent) {
   };
 }
 
-async function resolveFolderAccess(folderId, ownerPubkey = null) {
+async function resolveFolderContext(folderId, ownerPubkey = null) {
   const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
   const effectiveOwner = normalizePubkey(ownerPubkey || myPubkey);
-
   const folderEvent = await fetchFolder(effectiveOwner, folderId);
   if (!folderEvent) {
     throw new Error("Folder event not found");
   }
 
-  const shareEvent = await fetchLatestFolderShare(folderId, folderEvent.pubkey);
+  const folderAddress = buildFolderAddress(folderEvent);
+  return {
+    myPubkey,
+    ownerPubkey: folderEvent.pubkey,
+    folderEvent,
+    folderAddress,
+  };
+}
+
+function mustBeOwner(context) {
+  if (context.myPubkey !== context.ownerPubkey) {
+    throw new Error("Only the folder owner can change sharing state");
+  }
+}
+
+export async function getShareEvent(folderId, recipientPubkey, ownerPubkey = null) {
+  const context = await resolveFolderContext(folderId, ownerPubkey);
+  const recipient = normalizePubkey(recipientPubkey);
+  return fetchLatestFolderShare(folderId, context.ownerPubkey, recipient);
+}
+
+async function resolveFolderAccessKey(folderId, ownerPubkey = null, accessorPubkey = null) {
+  const context = await resolveFolderContext(folderId, ownerPubkey);
+  const recipient = normalizePubkey(accessorPubkey || context.myPubkey);
+  const shareEvent = await getShareEvent(folderId, recipient, context.ownerPubkey);
+
   if (!shareEvent) {
-    throw new Error("Folder share event not found");
+    throw new Error("Folder share event not found for this user");
   }
 
-  const encryptedFolderKey = getAccessKeyForRecipient(shareEvent, myPubkey);
+  const encryptedFolderKey = getTagValue(shareEvent, "key");
   if (!encryptedFolderKey) {
-    throw new Error("Current user does not have access to this folder key");
+    throw new Error("Folder share event is missing encrypted folder key");
   }
 
   const decryptedHex = await decryptNIP44(encryptedFolderKey, shareEvent.pubkey);
   const folderKey = hexToKey(decryptedHex);
-  const recipients = uniquePubkeys(getAllTagValues(shareEvent, "p"));
 
   return {
-    myPubkey,
-    folderEvent,
+    ...context,
     shareEvent,
     folderKey,
-    recipients,
   };
 }
 
-export async function createFolder(name, recipients = []) {
+export async function listRecipients(folderId, ownerPubkey = null) {
+  const { folderAddress } = await resolveFolderContext(folderId, ownerPubkey);
+  const shareEvents = await fetchShareEventsForFolder(folderAddress);
+  return uniquePubkeys(shareEvents.map((shareEvent) => getTagValue(shareEvent, "p")));
+}
+
+async function publishSharesForRecipients(folderId, ownerPubkey, folderKey, recipients) {
+  const uniqueRecipients = uniquePubkeys(recipients);
+  const entries = await buildRecipientEntries(folderKey, uniqueRecipients);
+  for (const entry of entries) {
+    await publishShareEvent({
+      folderId,
+      ownerPubkey,
+      recipientPubkey: entry.pubkey,
+      encryptedKey: entry.encryptedFolderKey,
+    });
+  }
+}
+
+export async function createFolder(name, recipients = [], options = {}) {
   const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
   const folderId = createRandomFolderId();
   const folderName = (name || "Untitled Folder").trim();
   const folderKey = await generateKey();
   const allowlist = uniquePubkeys([myPubkey, ...recipients]);
 
-  await publishFolderEvent(folderId, folderName);
-  const recipientEntries = await buildRecipientEntries(folderKey, allowlist);
-  await publishFolderShare({ folderId, recipients: recipientEntries, version: 1 });
+  await publishFolderEvent(folderId, folderName, options);
+  await publishSharesForRecipients(folderId, myPubkey, folderKey, allowlist);
 
   return {
     folderId,
@@ -139,93 +179,99 @@ export async function listUserFolders() {
 }
 
 export async function getFolderKey(folderId, ownerPubkey = null) {
-  const { folderKey } = await resolveFolderAccess(folderId, ownerPubkey);
+  const { folderKey } = await resolveFolderAccessKey(folderId, ownerPubkey);
   return folderKey;
 }
 
-export async function shareFolder(folderId, recipientPubkey, ownerPubkey = null) {
-  const { myPubkey, folderKey, recipients, shareEvent } = await resolveFolderAccess(folderId, ownerPubkey);
-  const allowlist = uniquePubkeys([myPubkey, ...recipients, normalizePubkey(recipientPubkey)]);
-  const recipientEntries = await buildRecipientEntries(folderKey, allowlist);
-  await publishFolderShare({
+export async function grantAccess(folderId, recipientPubkey, ownerPubkey = null, options = {}) {
+  const paymentEventId = options.paymentEventId || null;
+  const context = await resolveFolderAccessKey(folderId, ownerPubkey);
+  mustBeOwner(context);
+
+  const recipient = normalizePubkey(recipientPubkey);
+  const encryptedKey = await encryptNIP44(keyToHex(context.folderKey), recipient);
+  await publishShareEvent({
     folderId,
-    recipients: recipientEntries,
-    createdAt: (shareEvent?.created_at || 0) + 1,
-    version: getEventVersion(shareEvent) + 1,
+    ownerPubkey: context.ownerPubkey,
+    recipientPubkey: recipient,
+    encryptedKey,
+    payment: paymentEventId || null,
+    createdAt: (context.shareEvent?.created_at || 0) + 1,
   });
+}
+
+async function rewrapFolderFiles(folderEvent, folderId, oldFolderKey, newFolderKey) {
+  const files = await fetchFilesInFolder(folderEvent.pubkey, folderId);
+
+  for (const fileEvent of files) {
+    const wrappedFDK = getTagValue(fileEvent, "wrapped_fdk");
+    if (!wrappedFDK) continue;
+
+    const fileDataKey = await unwrapKey(wrappedFDK, oldFolderKey);
+    const nextWrappedFDK = await wrapKey(fileDataKey, newFolderKey);
+
+    await publishFileMetadata({
+      ...extractMetadataPayload(fileEvent),
+      createdAt: (fileEvent.created_at || 0) + 1,
+      fileVersion: getEventVersion(fileEvent) + 1,
+      wrappedFDK: nextWrappedFDK,
+      folderId,
+    });
+  }
+}
+
+async function rotateFolderKeyForRecipients(folderId, ownerPubkey, oldFolderKey, recipients) {
+  const folderEvent = await fetchFolder(ownerPubkey, folderId);
+  if (!folderEvent) {
+    throw new Error("Folder event not found");
+  }
+
+  const newFolderKey = await generateKey();
+  await rewrapFolderFiles(folderEvent, folderId, oldFolderKey, newFolderKey);
+  await publishSharesForRecipients(folderId, ownerPubkey, newFolderKey, recipients);
 }
 
 export async function rotateFolderKey(folderId, ownerPubkey = null) {
-  const { myPubkey, folderEvent, folderKey, recipients, shareEvent } = await resolveFolderAccess(folderId, ownerPubkey);
-  const files = await fetchFilesInFolder(folderEvent.pubkey, folderId);
-  const newFolderKey = await generateKey();
+  const context = await resolveFolderAccessKey(folderId, ownerPubkey);
+  mustBeOwner(context);
+  const recipients = await listRecipients(folderId, context.ownerPubkey);
+  await rotateFolderKeyForRecipients(folderId, context.ownerPubkey, context.folderKey, recipients);
+}
 
-  for (const fileEvent of files) {
-    const wrappedFDK = getTagValue(fileEvent, "wrapped_fdk");
-    if (!wrappedFDK) continue;
+export async function revokeAccess(folderId, recipientPubkey, ownerPubkey = null) {
+  const context = await resolveFolderAccessKey(folderId, ownerPubkey);
+  mustBeOwner(context);
 
-    const fileDataKey = await unwrapKey(wrappedFDK, folderKey);
-    const nextWrappedFDK = await wrapKey(fileDataKey, newFolderKey);
-
-    await publishFileMetadata({
-      ...extractMetadataPayload(fileEvent),
-      createdAt: (fileEvent.created_at || 0) + 1,
-      fileVersion: getEventVersion(fileEvent) + 1,
-      wrappedFDK: nextWrappedFDK,
-      folderId,
-    });
+  const revokedRecipient = normalizePubkey(recipientPubkey);
+  const shareEvent = await getShareEvent(folderId, revokedRecipient, context.ownerPubkey);
+  if (shareEvent?.id) {
+    await publishDeletion(shareEvent.id, "access revoked");
   }
 
-  const allowlist = uniquePubkeys([myPubkey, ...recipients]);
-  const recipientEntries = await buildRecipientEntries(newFolderKey, allowlist);
-  await publishFolderShare({
-    folderId,
-    recipients: recipientEntries,
-    createdAt: (shareEvent?.created_at || 0) + 1,
-    version: getEventVersion(shareEvent) + 1,
-  });
+  const recipients = (await listRecipients(folderId, context.ownerPubkey))
+    .filter((recipient) => recipient !== revokedRecipient);
+  if (!recipients.includes(context.ownerPubkey)) {
+    recipients.push(context.ownerPubkey);
+  }
+
+  await rotateFolderKeyForRecipients(folderId, context.ownerPubkey, context.folderKey, recipients);
+}
+
+export async function shareFolder(folderId, recipientPubkey, ownerPubkey = null) {
+  return grantAccess(folderId, recipientPubkey, ownerPubkey);
 }
 
 export async function revokeUser(folderId, recipientPubkey, ownerPubkey = null) {
-  const { myPubkey, folderEvent, folderKey, recipients, shareEvent } = await resolveFolderAccess(folderId, ownerPubkey);
-  const normalizedRecipientPubkey = normalizePubkey(recipientPubkey);
-  const files = await fetchFilesInFolder(folderEvent.pubkey, folderId);
-  const newFolderKey = await generateKey();
-
-  for (const fileEvent of files) {
-    const wrappedFDK = getTagValue(fileEvent, "wrapped_fdk");
-    if (!wrappedFDK) continue;
-
-    const fileDataKey = await unwrapKey(wrappedFDK, folderKey);
-    const nextWrappedFDK = await wrapKey(fileDataKey, newFolderKey);
-
-    await publishFileMetadata({
-      ...extractMetadataPayload(fileEvent),
-      createdAt: (fileEvent.created_at || 0) + 1,
-      fileVersion: getEventVersion(fileEvent) + 1,
-      wrappedFDK: nextWrappedFDK,
-      folderId,
-    });
-  }
-
-  const allowlist = uniquePubkeys([
-    myPubkey,
-    ...recipients.filter((recipient) => recipient !== normalizedRecipientPubkey),
-  ]);
-  const recipientEntries = await buildRecipientEntries(newFolderKey, allowlist);
-  await publishFolderShare({
-    folderId,
-    recipients: recipientEntries,
-    createdAt: (shareEvent?.created_at || 0) + 1,
-    version: getEventVersion(shareEvent) + 1,
-  });
+  return revokeAccess(folderId, recipientPubkey, ownerPubkey);
 }
 
 export async function getFolderAccessState(folderId, ownerPubkey = null) {
-  const { folderEvent, recipients } = await resolveFolderAccess(folderId, ownerPubkey);
+  const context = await resolveFolderContext(folderId, ownerPubkey);
+  const recipients = await listRecipients(folderId, context.ownerPubkey);
+
   return {
-    ownerPubkey: folderEvent.pubkey,
-    folderName: getTagValue(folderEvent, "name") || folderId,
+    ownerPubkey: context.folderEvent.pubkey,
+    folderName: getTagValue(context.folderEvent, "name") || folderId,
     recipients,
   };
 }

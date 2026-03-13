@@ -16,6 +16,7 @@ import { deleteFile as deleteFileRecord, deleteFolder as deleteFolderRecord } fr
 import {
   fetchFilesInFolder,
   fetchFolder,
+  fetchPaidFolders,
   getFolderIdFromRef,
   fetchLatestMetadata,
   publishFileMetadata,
@@ -23,14 +24,40 @@ import {
   fetchUserFolders,
   getTagValue,
 } from "./nostr.js";
+import { startZapReceiptListener, unlockFolderWithZap } from "./payments.js";
 import {
   createFolder as createFolderRecord,
-  getFolderAccessState,
+  grantAccess,
   getFolderKey,
-  revokeUser as revokeFolderUser,
+  listRecipients as listFolderRecipients,
+  revokeAccess,
   rotateFolderKey as rotateFolderAccessKey,
-  shareFolder as shareFolderAccess,
 } from "./folders.js";
+
+function normalizePubkey(pubkey) {
+  const value = (pubkey || "").trim();
+  if (!value) return "";
+
+  if (value.startsWith("npub")) {
+    const decoded = window.NostrTools?.nip19?.decode?.(value);
+    if (!decoded || decoded.type !== "npub" || !decoded.data) {
+      throw new Error("Invalid npub public key");
+    }
+    return String(decoded.data).toLowerCase();
+  }
+
+  return value.toLowerCase();
+}
+
+function parseFolderAddress(address) {
+  const parts = (address || "").split(":");
+  if (parts.length !== 3) return null;
+  if (parts[0] !== "30000") return null;
+  return {
+    ownerPubkey: parts[1],
+    folderId: parts[2],
+  };
+}
 
 function base64UrlEncode(data) {
   return btoa(data).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -80,6 +107,11 @@ function mapFileEvent(event) {
   };
 }
 
+function isPaidFolder(folderEvent) {
+  const price = Number.parseInt(getTagValue(folderEvent, "price") || "0", 10);
+  return Number.isFinite(price) && price > 0;
+}
+
 async function enrichFolderEvent(folderEvent) {
   const folderId = getTagValue(folderEvent, "d");
   const files = await fetchFilesInFolder(folderEvent.pubkey, folderId);
@@ -88,6 +120,8 @@ async function enrichFolderEvent(folderEvent) {
     folderName: getTagValue(folderEvent, "name") || folderId,
     ownerPubkey: folderEvent.pubkey,
     createdAt: folderEvent.created_at,
+    priceMsats: Number.parseInt(getTagValue(folderEvent, "price") || "0", 10) || null,
+    zapTarget: getTagValue(folderEvent, "zap") || null,
     fileCount: files.length,
   };
 }
@@ -109,8 +143,8 @@ async function getUploadsFromBlossom() {
   return response.json();
 }
 
-export async function createFolder(name, recipients = []) {
-  return createFolderRecord(name, recipients);
+export async function createFolder(name, recipients = [], options = {}) {
+  return createFolderRecord(name, recipients, options);
 }
 
 export async function uploadFiles(folderId, files, options = {}, onProgress = () => {}) {
@@ -216,11 +250,15 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
 }
 
 export async function shareFolder(folderId, pubkey, ownerPubkey = null) {
-  return shareFolderAccess(folderId, pubkey, ownerPubkey);
+  return grantAccess(folderId, pubkey, ownerPubkey);
 }
 
 export async function revokeUser(folderId, pubkey, ownerPubkey = null) {
-  return revokeFolderUser(folderId, pubkey, ownerPubkey);
+  return revokeAccess(folderId, pubkey, ownerPubkey);
+}
+
+export async function revokeFolderAccess(folderId, pubkey, ownerPubkey = null) {
+  return revokeAccess(folderId, pubkey, ownerPubkey);
 }
 
 export async function rotateFolderKey(folderId, ownerPubkey = null) {
@@ -240,22 +278,32 @@ export async function listFiles(folderId, ownerPubkey = null) {
 }
 
 export async function listSharedWithMe() {
-  const myPubkey = await window.nostr.getPublicKey();
+  const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
   const shareEvents = await fetchSharedFoldersForRecipient(myPubkey);
 
   const folders = await Promise.allSettled(
     shareEvents
-      .filter((shareEvent) => shareEvent.pubkey !== myPubkey)
       .map(async (shareEvent) => {
-        const folderId = getTagValue(shareEvent, "folder") || getTagValue(shareEvent, "d");
-        const folderEvent = await fetchFolder(shareEvent.pubkey, folderId);
-        const files = await fetchFilesInFolder(shareEvent.pubkey, folderId);
+        const folderAddress = getTagValue(shareEvent, "a");
+        const parsedAddress = parseFolderAddress(folderAddress);
+        const folderId = parsedAddress?.folderId || getTagValue(shareEvent, "folder") || getTagValue(shareEvent, "d");
+        const ownerPubkey = normalizePubkey(parsedAddress?.ownerPubkey || shareEvent.pubkey);
+
+        // Ignore self-owned folders in "shared with me".
+        if (ownerPubkey === myPubkey) {
+          return null;
+        }
+
+        const folderEvent = await fetchFolder(ownerPubkey, folderId);
+        const files = await fetchFilesInFolder(ownerPubkey, folderId);
 
         return {
           folderId,
           folderName: (folderEvent && getTagValue(folderEvent, "name")) || folderId,
-          ownerPubkey: shareEvent.pubkey,
+          ownerPubkey,
           sharedAt: shareEvent.created_at,
+          priceMsats: Number.parseInt(getTagValue(folderEvent || shareEvent, "price") || "0", 10) || null,
+          zapTarget: getTagValue(folderEvent || shareEvent, "zap") || null,
           fileCount: files.length,
         };
       }),
@@ -264,12 +312,65 @@ export async function listSharedWithMe() {
   return folders
     .filter((result) => result.status === "fulfilled")
     .map((result) => result.value)
+    .filter(Boolean)
     .sort((a, b) => b.sharedAt - a.sharedAt);
 }
 
 export async function getFolderRecipients(folderId, ownerPubkey = null) {
-  const access = await getFolderAccessState(folderId, ownerPubkey);
-  return access.recipients;
+  return listFolderRecipients(folderId, ownerPubkey);
+}
+
+export async function listRecipients(folderId, ownerPubkey = null) {
+  return listFolderRecipients(folderId, ownerPubkey);
+}
+
+export async function listSharedFolders() {
+  return listSharedWithMe();
+}
+
+export async function listLockedFolders() {
+  const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
+  const [paidFolderEvents, sharedFolders] = await Promise.all([
+    fetchPaidFolders(),
+    listSharedWithMe(),
+  ]);
+
+  const sharedSet = new Set(sharedFolders.map((folder) => `${normalizePubkey(folder.ownerPubkey)}:${folder.folderId}`));
+
+  const locked = [];
+  for (const folderEvent of paidFolderEvents) {
+    if (!isPaidFolder(folderEvent)) continue;
+
+    const folderId = getTagValue(folderEvent, "d");
+    const ownerPubkey = normalizePubkey(folderEvent.pubkey);
+    if (!folderId || !ownerPubkey) continue;
+    if (ownerPubkey === myPubkey) continue;
+
+    const shareKey = `${ownerPubkey}:${folderId}`;
+    if (sharedSet.has(shareKey)) continue;
+
+    locked.push({
+      folderId,
+      folderName: getTagValue(folderEvent, "name") || folderId,
+      ownerPubkey,
+      createdAt: folderEvent.created_at,
+      fileCount: 0,
+      priceMsats: Number.parseInt(getTagValue(folderEvent, "price") || "0", 10) || null,
+      zapTarget: getTagValue(folderEvent, "zap") || null,
+      locked: true,
+      source: "locked",
+    });
+  }
+
+  return locked.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+export async function unlockFolder(folderId, ownerPubkey) {
+  return unlockFolderWithZap(folderId, ownerPubkey);
+}
+
+export function startFolderPaymentListener(ownerPubkey, handlers = {}) {
+  return startZapReceiptListener(ownerPubkey, handlers);
 }
 
 export async function listRawUploads() {

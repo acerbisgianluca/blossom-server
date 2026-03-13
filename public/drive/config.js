@@ -24,5 +24,5 @@ export function getBlossomUrl() {
 export const EVENT_KINDS = {
   FOLDER: 30000,        // Parameterized replaceable folder definition
   FILE_METADATA: 1063,  // NIP-94 media event
-  SHARE: 30001,         // Parameterized replaceable share event per folder
+  SHARE: 30001,         // Parameterized replaceable share event per recipient
 };

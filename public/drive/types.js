@@ -20,10 +20,10 @@
 
 /**
  * @typedef {Object} ShareEventPayload
- * @property {string} blobHash - SHA256 of encrypted blob
- * @property {string[]} recipients - Nostr pubkeys allowlisted for access
- * @property {Array<{pubkey: string, encryptedFAK: string}>} accessKeys - NIP-44 encrypted FAK per recipient
- * @property {string} senderPubkey - Nostr pubkey of sender
+ * @property {string} folderAddress - Nostr a-tag value (30000:<owner_pubkey>:<folder_id>)
+ * @property {string} recipientPubkey - Recipient pubkey for this grant
+ * @property {string} encryptedFAK - NIP-44 encrypted folder access key for recipient
+ * @property {string} senderPubkey - Nostr pubkey of owner/sender
  * @property {number} sharedAt - Unix timestamp
  */
 

@@ -5,6 +5,7 @@
 import { deleteBlob } from "./blossom.js";
 import {
   fetchFileMetadata,
+  fetchLatestMetadataForOwner,
   fetchFolder,
   fetchFolderFiles,
   fetchFolderShareEvents,
@@ -21,7 +22,7 @@ function normalizePubkey(pubkey) {
     }
   }
 
-  return pubkey;
+  return (pubkey || "").toLowerCase();
 }
 
 function isOwner(event, pubkey) {
@@ -41,12 +42,16 @@ export async function deleteBlobFromBlossom(hash) {
   return deleteBlob(hash);
 }
 
-export async function deleteFile(blobHash) {
+export async function deleteFile(blobHash, options = {}) {
   if (!blobHash) {
     throw new Error("Missing blob hash for deletion");
   }
 
-  const metadataEvent = await fetchFileMetadata(blobHash);
+  const expectedOwnerPubkey = normalizePubkey(options.ownerPubkey || "");
+
+  const metadataEvent = expectedOwnerPubkey
+    ? await fetchLatestMetadataForOwner(blobHash, expectedOwnerPubkey)
+    : await fetchFileMetadata(blobHash);
   if (!metadataEvent) {
     throw new Error("File metadata event not found");
   }
@@ -102,7 +107,7 @@ export async function deleteFolder(folderId) {
   for (const fileEvent of files) {
     const blobHash = getTagValue(fileEvent, "x");
     if (!blobHash) continue;
-    await deleteFile(blobHash);
+    await deleteFile(blobHash, { ownerPubkey: myPubkey });
   }
 
   const shareEvents = await fetchFolderShareEvents(folderId, myPubkey);

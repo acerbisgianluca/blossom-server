@@ -297,6 +297,9 @@ export async function listSharedWithMe() {
         }
 
         const folderEvent = await fetchFolder(ownerPubkey, folderId);
+        if (!folderEvent) {
+          return null;
+        }
         const files = await fetchFilesInFolder(ownerPubkey, folderId);
 
         return {
@@ -379,8 +382,8 @@ export async function listRawUploads() {
   return getUploadsFromBlossom();
 }
 
-export async function deleteFile(blobHash) {
-  return deleteFileRecord(blobHash);
+export async function deleteFile(blobHash, options = {}) {
+  return deleteFileRecord(blobHash, options);
 }
 
 export async function deleteFolder(folderId) {

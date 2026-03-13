@@ -1,6 +1,6 @@
-# 🌸 Blossom-server
+# 🌸 Drostr
 
-blossom-server is a Typescript implementation of a [Blossom Server](https://github.com/hzrd149/blossom)
+Drostr is a Typescript implementation of a [Blossom Server](https://github.com/hzrd149/blossom)
 
 ## Supported BUDs
 
@@ -10,10 +10,6 @@ blossom-server is a Typescript implementation of a [Blossom Server](https://gith
 - [x] BUD-04
 - [x] BUD-05
 - [x] BUD-06
-
-## Encrypted Drive (Browser Client)
-
-A client-side encrypted folder sharing system built on Nostr and Blossom.
 
 ### Features
 

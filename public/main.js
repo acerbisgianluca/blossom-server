@@ -53,7 +53,7 @@ export class BlossomApp extends LitElement {
           <div class="mx-auto flex w-full max-w-6xl items-center gap-3 px-4 py-3 sm:px-6">
             <div>
               <p class="text-xs uppercase tracking-[0.26em] text-green-600">Blossom</p>
-              <h1 class="text-lg font-semibold text-green-300 sm:text-xl">Encrypted Drive</h1>
+              <h1 class="text-lg font-semibold text-green-300 sm:text-xl">Drostr</h1>
             </div>
 
             <div class="ml-auto flex items-center gap-2 rounded-xl border border-green-900 bg-black p-1">

@@ -6,6 +6,10 @@
 import { getBlossomUrl } from "./config.js";
 import { unixNow, newExpirationValue, getFileSha256 } from "../utils.js";
 
+function base64UrlEncode(data) {
+  return btoa(data).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
 /**
  * Upload encrypted blob to Blossom server
  * @param {Uint8Array} encryptedBlob - Encrypted file data
@@ -31,7 +35,7 @@ export async function uploadBlob(encryptedBlob, mimeType = "application/octet-st
     ],
   });
 
-  const authorization = "Nostr " + btoa(JSON.stringify(auth));
+  const authorization = "Nostr " + base64UrlEncode(JSON.stringify(auth));
 
   // Check upload capability
   const checkRes = await fetch(endpoint, {
@@ -110,7 +114,7 @@ export async function deleteBlob(hash) {
     ],
   });
 
-  const authorization = "Nostr " + btoa(JSON.stringify(auth));
+  const authorization = "Nostr " + base64UrlEncode(JSON.stringify(auth));
 
   const res = await fetch(url, {
     method: "DELETE",

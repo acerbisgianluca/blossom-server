@@ -72,6 +72,35 @@ function createFileId() {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+function getDeletedEventIds(events) {
+  return new Set(
+    (events || [])
+      .flatMap((event) => (event.tags || []))
+      .filter((tag) => Array.isArray(tag) && tag[0] === "e" && tag[1])
+      .map((tag) => tag[1]),
+  );
+}
+
+async function fetchDeletionEventsForRefs(eventIds, limitPerBatch = 500) {
+  const ids = [...new Set((eventIds || []).filter(Boolean))];
+  if (!ids.length) return [];
+
+  const batches = [];
+  for (let index = 0; index < ids.length; index += 150) {
+    batches.push(ids.slice(index, index + 150));
+  }
+
+  const results = await Promise.all(
+    batches.map((batch) => fetchEvents({
+      kinds: [5],
+      "#e": batch,
+      limit: Math.max(limitPerBatch, batch.length),
+    })),
+  );
+
+  return results.flat();
+}
+
 export function initRelayPool() {
   if (pool) return pool;
 
@@ -282,14 +311,27 @@ export async function publishShareEvent(shareData) {
 
 export async function fetchUserFolders(pubkey) {
   const normalizedPubkey = normalizePubkey(pubkey);
-  const events = await fetchEvents({
-    kinds: getFolderKinds(),
-    authors: [normalizedPubkey],
-    limit: 200,
-  });
+  const [events, deletionEvents] = await Promise.all([
+    fetchEvents({
+      kinds: getFolderKinds(),
+      authors: [normalizedPubkey],
+      limit: 200,
+    }),
+    fetchEvents({
+      kinds: [5],
+      authors: [normalizedPubkey],
+      limit: 1000,
+    }),
+  ]);
+
+  const deletedEventIds = getDeletedEventIds(deletionEvents);
 
   const latestByFolderId = new Map();
   for (const event of events) {
+    if (deletedEventIds.has(event.id)) {
+      continue;
+    }
+
     const folderId = getTagValue(event, "d");
     if (!folderId) continue;
 
@@ -327,15 +369,33 @@ export async function fetchPaidFolders(limit = 300) {
 export async function fetchFilesInFolder(ownerPubkey, folderId) {
   const normalizedPubkey = normalizePubkey(ownerPubkey);
   const addressableRef = getFolderAddress(normalizedPubkey, folderId);
-  const events = await fetchEvents({
-    kinds: [EVENT_KINDS.FILE_METADATA],
-    authors: [normalizedPubkey],
-    limit: 500,
-  });
+  const [events, deletionEvents] = await Promise.all([
+    fetchEvents({
+      kinds: [EVENT_KINDS.FILE_METADATA],
+      authors: [normalizedPubkey],
+      limit: 500,
+    }),
+    fetchEvents({
+      kinds: [5],
+      authors: [normalizedPubkey],
+      limit: 1000,
+    }),
+  ]);
+
+  const deletedEventIds = new Set(
+    (deletionEvents || [])
+      .flatMap((event) => (event.tags || []))
+      .filter((tag) => Array.isArray(tag) && tag[0] === "e" && tag[1])
+      .map((tag) => tag[1]),
+  );
 
   const latestByFileIdentity = new Map();
 
   for (const event of events) {
+    if (deletedEventIds.has(event.id)) {
+      continue;
+    }
+
     const folderRef = getTagValue(event, "a") || getTagValue(event, "folder");
     const rawFolderId = getFolderIdFromRef(folderRef);
     if (folderRef !== addressableRef && rawFolderId !== folderId) {
@@ -401,16 +461,26 @@ export async function fetchLatestFolderShare(folderId, ownerPubkey = null, recip
 
 export async function fetchFolder(pubkey, folderId) {
   const normalizedPubkey = normalizePubkey(pubkey);
-  const events = await fetchEvents({
-    kinds: getFolderKinds(),
-    authors: [normalizedPubkey],
-    "#d": [folderId],
-    limit: 50,
-  });
+  const [events, deletionEvents] = await Promise.all([
+    fetchEvents({
+      kinds: getFolderKinds(),
+      authors: [normalizedPubkey],
+      "#d": [folderId],
+      limit: 50,
+    }),
+    fetchEvents({
+      kinds: [5],
+      authors: [normalizedPubkey],
+      limit: 1000,
+    }),
+  ]);
 
-  if (events.length > 0) {
-    events.sort(compareEventsNewestFirst);
-    return events[0];
+  const deletedEventIds = getDeletedEventIds(deletionEvents);
+  const activeEvents = events.filter((event) => !deletedEventIds.has(event.id));
+
+  if (activeEvents.length > 0) {
+    activeEvents.sort(compareEventsNewestFirst);
+    return activeEvents[0];
   }
 
   const allAuthorFolders = await fetchUserFolders(normalizedPubkey);
@@ -435,6 +505,20 @@ export async function fetchFileMetadata(blobHash) {
 
 export async function fetchLatestMetadata(blobHash) {
   return fetchFileMetadataByHash(blobHash);
+}
+
+export async function fetchLatestMetadataForOwner(blobHash, ownerPubkey) {
+  const normalizedPubkey = normalizePubkey(ownerPubkey);
+  const events = await fetchEvents({
+    kinds: [EVENT_KINDS.FILE_METADATA],
+    authors: [normalizedPubkey],
+    "#x": [blobHash],
+    limit: 50,
+  });
+
+  if (!events.length) return null;
+  events.sort(compareEventsNewestFirst);
+  return events[0];
 }
 
 export async function fetchFolderFiles(folderId, ownerPubkey = null) {
@@ -492,12 +576,12 @@ export async function fetchUserProfile(pubkey) {
 
 export function subscribeToFolderSharesForRecipient(recipientPubkey, handlers = {}, options = {}) {
   const { onEvent, onError } = handlers;
-  const { sinceSecondsAgo = 300 } = options;
+  const { sinceSecondsAgo = 300, includeDeletionEvents = true } = options;
   const normalizedPubkey = normalizePubkey(recipientPubkey);
   const relayPool = initRelayPool();
   const seenEventIds = new Set();
 
-  const sub = relayPool.subscribeMany(
+  const shareSub = relayPool.subscribeMany(
     RELAYS,
     [
       {
@@ -507,15 +591,94 @@ export function subscribeToFolderSharesForRecipient(recipientPubkey, handlers = 
       },
     ],
     {
-      onevent: (shareEvent) => {
-        if (!getShareKinds().includes(shareEvent.kind)) return;
-        if (seenEventIds.has(shareEvent.id)) return;
-        seenEventIds.add(shareEvent.id);
-        onEvent?.(shareEvent);
+      onevent: (event) => {
+        if (!getShareKinds().includes(event.kind)) return;
+        if (seenEventIds.has(event.id)) return;
+        seenEventIds.add(event.id);
+        onEvent?.(event);
       },
       onclose: (reasons) => {
         if (reasons?.length) {
           onError?.(new Error(`Folder share subscription closed: ${reasons.join(", ")}`));
+        }
+      },
+    },
+  );
+
+  let deletionSub = null;
+  if (includeDeletionEvents) {
+    deletionSub = relayPool.subscribeMany(
+      RELAYS,
+      [
+        {
+          kinds: [5],
+          since: unixNow() - sinceSecondsAgo,
+        },
+      ],
+      {
+        onevent: (event) => {
+          if (event.kind !== 5) return;
+          if (seenEventIds.has(event.id)) return;
+          seenEventIds.add(event.id);
+          onEvent?.(event);
+        },
+        onclose: (reasons) => {
+          if (reasons?.length) {
+            onError?.(new Error(`Folder deletion subscription closed: ${reasons.join(", ")}`));
+          }
+        },
+      },
+    );
+  }
+
+  return () => {
+    shareSub.close();
+    deletionSub?.close();
+  };
+}
+
+export function subscribeToFolderFileMetadata(ownerPubkey, folderId, handlers = {}, options = {}) {
+  const { onEvent, onError } = handlers;
+  const { sinceSecondsAgo = 300 } = options;
+  const normalizedOwner = normalizePubkey(ownerPubkey);
+  const relayPool = initRelayPool();
+  const seenEventIds = new Set();
+
+  const sub = relayPool.subscribeMany(
+    RELAYS,
+    [
+      {
+        kinds: [EVENT_KINDS.FILE_METADATA, 5],
+        authors: [normalizedOwner],
+        since: unixNow() - sinceSecondsAgo,
+      },
+    ],
+    {
+      onevent: (fileEvent) => {
+        if (fileEvent.kind === 5) {
+          if (seenEventIds.has(fileEvent.id)) return;
+          seenEventIds.add(fileEvent.id);
+          onEvent?.(fileEvent);
+          return;
+        }
+
+        if (fileEvent.kind !== EVENT_KINDS.FILE_METADATA) return;
+
+        const folderRef = getTagValue(fileEvent, "a") || getTagValue(fileEvent, "folder");
+        const parsedAddress = parseFolderAddress(folderRef);
+        const eventFolderId = parsedAddress?.folderId || getFolderIdFromRef(folderRef);
+        if (eventFolderId !== folderId) return;
+
+        const eventOwner = parsedAddress?.ownerPubkey || normalizePubkey(fileEvent.pubkey);
+        if (eventOwner !== normalizedOwner) return;
+
+        if (seenEventIds.has(fileEvent.id)) return;
+        seenEventIds.add(fileEvent.id);
+        onEvent?.(fileEvent);
+      },
+      onclose: (reasons) => {
+        if (reasons?.length) {
+          onError?.(new Error(`Folder file subscription closed: ${reasons.join(", ")}`));
         }
       },
     },
@@ -754,7 +917,17 @@ export async function fetchShareEventsForFolder(folderAddress) {
     }
   }
 
+  const deletedEventIds = getDeletedEventIds(await fetchEvents({
+    kinds: [5],
+    authors: [ownerPubkey],
+    limit: 1000,
+  }));
+
   const canonical = events.filter((event) => {
+    if (deletedEventIds.has(event.id)) {
+      return false;
+    }
+
     const recipient = getTagValue(event, "p");
     const encryptedKey = getTagValue(event, "key");
     const parsedEventAddress = parseFolderAddress(getTagValue(event, "a"));
@@ -799,7 +972,12 @@ export async function fetchShareEventsForUser(pubkey) {
     return eventRecipient === normalizedPubkey && !!getTagValue(event, "a") && !!getTagValue(event, "key");
   });
 
-  return dedupeShareEvents(canonical);
+  const deletionEvents = await fetchDeletionEventsForRefs(canonical.map((event) => event.id));
+  const deletedEventIds = getDeletedEventIds(deletionEvents);
+
+  const activeCanonical = canonical.filter((event) => !deletedEventIds.has(event.id));
+
+  return dedupeShareEvents(activeCanonical);
 }
 
 export async function publishDeletion(eventId, reason = "") {

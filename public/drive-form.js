@@ -21,7 +21,11 @@ import {
   unlockFolder,
   uploadFiles,
 } from "./drive/drive.js";
-import { subscribeToFolderSharesForRecipient, fetchUserProfile } from "./drive/nostr.js";
+import {
+  subscribeToFolderFileMetadata,
+  subscribeToFolderSharesForRecipient,
+  fetchUserProfile,
+} from "./drive/nostr.js";
 
 function stageToPercent(stage) {
   switch (stage) {
@@ -100,6 +104,10 @@ export class DriveForm extends LitElement {
     this.sharedUnreadCount = 0;
     this._shareSubscriptionClose = null;
     this._paymentSubscriptionClose = null;
+    this._fileSubscriptionClose = null;
+    this._fileSubscriptionKey = null;
+    this._fileRefreshTimer = null;
+    this._sharedRefreshRetryTimer = null;
     this._isDestroyed = false;
     this._profileCache = {}; // Cache for user profiles
   }
@@ -136,6 +144,19 @@ export class DriveForm extends LitElement {
       this._paymentSubscriptionClose();
       this._paymentSubscriptionClose = null;
     }
+    if (this._fileSubscriptionClose) {
+      this._fileSubscriptionClose();
+      this._fileSubscriptionClose = null;
+    }
+    this._fileSubscriptionKey = null;
+    if (this._fileRefreshTimer) {
+      clearTimeout(this._fileRefreshTimer);
+      this._fileRefreshTimer = null;
+    }
+    if (this._sharedRefreshRetryTimer) {
+      clearTimeout(this._sharedRefreshRetryTimer);
+      this._sharedRefreshRetryTimer = null;
+    }
   }
 
   updated(changedProperties) {
@@ -152,13 +173,22 @@ export class DriveForm extends LitElement {
             void this.selectFolder(preferred);
           }
         } else {
-          this.selectedFolder = null;
-          this.folderFiles = [];
+          this.resetSelectedFolderState();
         }
       } else {
         const preferred = this.ownedFolders[0];
-        if (preferred && (!this.selectedFolder || this.selectedFolder.source !== preferred.source)) {
+        if (
+          preferred
+          && (
+            !this.selectedFolder
+            || this.selectedFolder.source !== preferred.source
+            || this.selectedFolder.folderId !== preferred.folderId
+            || this.selectedFolder.ownerPubkey !== preferred.ownerPubkey
+          )
+        ) {
           void this.selectFolder(preferred);
+        } else if (!preferred) {
+          this.resetSelectedFolderState();
         }
       }
     }
@@ -209,9 +239,16 @@ export class DriveForm extends LitElement {
 
     this._shareSubscriptionClose = subscribeToFolderSharesForRecipient(this.myPubkey, {
       onEvent: async (event) => {
-        if (event.pubkey === this.myPubkey) return;
+        const isDeletionEvent = event.kind === 5;
+        if (!isDeletionEvent && event.pubkey === this.myPubkey) return;
+
         await this.refreshSharedFoldersOnly();
-        if (!this.sharedPanelOpen) {
+
+        // Relay indexing can lag briefly; run one follow-up reconciliation pass.
+        this.scheduleSharedRefreshRetry();
+
+        // Only count fresh share grants as unread notifications.
+        if (!isDeletionEvent && !this.sharedPanelOpen) {
           this.sharedUnreadCount += 1;
         }
       },
@@ -219,6 +256,21 @@ export class DriveForm extends LitElement {
         console.warn("Folder share subscription error:", error);
       },
     }, { sinceSecondsAgo: 900 });
+  }
+
+  scheduleSharedRefreshRetry(delayMs = 1500) {
+    if (this._sharedRefreshRetryTimer) {
+      clearTimeout(this._sharedRefreshRetryTimer);
+    }
+
+    this._sharedRefreshRetryTimer = setTimeout(async () => {
+      this._sharedRefreshRetryTimer = null;
+      try {
+        await this.refreshSharedFoldersOnly();
+      } catch (error) {
+        console.warn("Delayed shared-folder refresh failed:", error);
+      }
+    }, delayMs);
   }
 
   startPaymentSubscription() {
@@ -242,17 +294,51 @@ export class DriveForm extends LitElement {
       listSharedWithMe(),
       listLockedFolders(),
     ]);
-    this.sharedFolders = sharedFolders;
-    this.lockedFolders = lockedFolders;
+    const nextSharedFolders = sharedFolders.map((folder) => ({ ...folder, source: "shared" }));
+    const nextLockedFolders = lockedFolders.map((folder) => ({ ...folder, source: "locked" }));
+    const visibleSharedFolders = [...nextSharedFolders, ...nextLockedFolders];
 
-    if (this.selectedFolder && (this.selectedFolder.source === "shared" || this.selectedFolder.source === "locked")) {
-      const selected = [...sharedFolders, ...lockedFolders].find(
-        (folder) => folder.folderId === this.selectedFolder.folderId && folder.ownerPubkey === this.selectedFolder.ownerPubkey,
-      );
-      if (selected) {
-        await this.selectFolder(selected);
+    this.sharedFolders = nextSharedFolders;
+    this.lockedFolders = nextLockedFolders;
+
+    if (!this.selectedFolder) {
+      return;
+    }
+
+    const shouldReconcileSelection = this.mode === "shared"
+      || this.selectedFolder.source === "shared"
+      || this.selectedFolder.source === "locked";
+    if (!shouldReconcileSelection) {
+      return;
+    }
+
+    const selected = visibleSharedFolders.find(
+      (folder) => (
+        folder.folderId === this.selectedFolder.folderId
+        && this.normalizePubkey(folder.ownerPubkey) === this.normalizePubkey(this.selectedFolder.ownerPubkey)
+      ),
+    );
+    if (selected) {
+      await this.selectFolder(selected);
+    } else {
+      const fallback = this.mode === "shared"
+        ? (visibleSharedFolders[0] || null)
+        : (this.ownedFolders[0] || null);
+      if (fallback) {
+        await this.selectFolder(fallback);
+      } else {
+        this.resetSelectedFolderState();
       }
     }
+  }
+
+  resetSelectedFolderState() {
+    this.selectedFolder = null;
+    this.folderFiles = [];
+    this.selectedFolderRecipients = [];
+    this.selectedFolderRecipientInput = "";
+    this.filesLoading = false;
+    this.startFileSubscription(null);
   }
 
   async refreshSidebarData() {
@@ -269,25 +355,28 @@ export class DriveForm extends LitElement {
       this.sharedFolders = sharedFolders.map((folder) => ({ ...folder, source: "shared" }));
       this.lockedFolders = lockedFolders.map((folder) => ({ ...folder, source: "locked" }));
 
-      const allFolders = [...this.ownedFolders, ...this.sharedFolders, ...this.lockedFolders];
-      if (!this.selectedFolder && allFolders.length > 0) {
-        const preferred = this.mode === "shared"
-          ? this.sharedFolders[0] || this.lockedFolders[0] || this.ownedFolders[0]
-          : this.ownedFolders[0] || this.sharedFolders[0] || this.lockedFolders[0];
-        if (preferred) {
-          await this.selectFolder(preferred);
-        }
-      } else if (this.selectedFolder) {
-        const updatedSelection = allFolders.find(
-          (folder) => folder.folderId === this.selectedFolder.folderId && folder.ownerPubkey === this.selectedFolder.ownerPubkey,
-        );
-        if (updatedSelection) {
-          await this.selectFolder(updatedSelection);
-        } else if (allFolders.length > 0) {
-          await this.selectFolder(allFolders[0]);
+        const visibleFolders = this.mode === "shared"
+          ? [...this.sharedFolders, ...this.lockedFolders]
+          : [...this.ownedFolders];
+
+        if (!this.selectedFolder && visibleFolders.length > 0) {
+          const preferred = visibleFolders[0];
+          if (preferred) {
+            await this.selectFolder(preferred);
+          }
+        } else if (this.selectedFolder) {
+          const updatedSelection = visibleFolders.find(
+            (folder) => (
+              folder.folderId === this.selectedFolder.folderId
+              && this.normalizePubkey(folder.ownerPubkey) === this.normalizePubkey(this.selectedFolder.ownerPubkey)
+            ),
+          );
+          if (updatedSelection) {
+            await this.selectFolder(updatedSelection);
+          } else if (visibleFolders.length > 0) {
+            await this.selectFolder(visibleFolders[0]);
         } else {
-          this.selectedFolder = null;
-          this.folderFiles = [];
+          this.resetSelectedFolderState();
         }
       }
     } catch (error) {
@@ -301,6 +390,7 @@ export class DriveForm extends LitElement {
     if (!folder) return;
 
     this.selectedFolder = folder;
+    this.startFileSubscription(folder);
     this.filesLoading = true;
 
     try {
@@ -327,6 +417,73 @@ export class DriveForm extends LitElement {
     } finally {
       this.filesLoading = false;
     }
+  }
+
+  async refreshSelectedFolderFiles() {
+    const folder = this.selectedFolder;
+    if (!folder || folder.locked || folder.source === "locked") {
+      return;
+    }
+
+    const files = await listFiles(folder.folderId, folder.ownerPubkey);
+    this.folderFiles = files;
+
+    const updateCount = (item) => (
+      item.folderId === folder.folderId && this.normalizePubkey(item.ownerPubkey) === this.normalizePubkey(folder.ownerPubkey)
+        ? { ...item, fileCount: files.length }
+        : item
+    );
+
+    this.ownedFolders = this.ownedFolders.map(updateCount);
+    this.sharedFolders = this.sharedFolders.map(updateCount);
+    this.lockedFolders = this.lockedFolders.map(updateCount);
+  }
+
+  startFileSubscription(folder) {
+    const owner = this.normalizePubkey(folder?.ownerPubkey || "");
+    const folderId = folder?.folderId || "";
+    const shouldSubscribe = !!(folder && !folder.locked && folderId && owner);
+    const nextKey = shouldSubscribe ? `${owner}:${folderId}` : null;
+
+    if (nextKey && this._fileSubscriptionClose && this._fileSubscriptionKey === nextKey) {
+      return;
+    }
+
+    if (this._fileSubscriptionClose) {
+      this._fileSubscriptionClose();
+      this._fileSubscriptionClose = null;
+    }
+    this._fileSubscriptionKey = null;
+
+    if (!shouldSubscribe) {
+      return;
+    }
+
+    this._fileSubscriptionKey = nextKey;
+    this._fileSubscriptionClose = subscribeToFolderFileMetadata(owner, folderId, {
+      onEvent: () => {
+        const selected = this.selectedFolder;
+        if (!selected) return;
+
+        const sameFolder = selected.folderId === folderId
+          && this.normalizePubkey(selected.ownerPubkey) === owner;
+        if (!sameFolder) return;
+
+        // Batch relay bursts into one refresh to avoid repeated list calls.
+        if (this._fileRefreshTimer) return;
+        this._fileRefreshTimer = setTimeout(async () => {
+          this._fileRefreshTimer = null;
+          try {
+            await this.refreshSelectedFolderFiles();
+          } catch (error) {
+            console.warn("Failed to refresh folder after live file event:", error);
+          }
+        }, 300);
+      },
+      onError: (error) => {
+        console.warn("Folder file subscription error:", error);
+      },
+    }, { sinceSecondsAgo: 900 });
   }
 
   normalizeRecipient(value) {
@@ -746,7 +903,7 @@ export class DriveForm extends LitElement {
     const confirmed = window.confirm("Delete this file? This action cannot be undone.");
     if (!confirmed) return;
 
-    if (fileItem.uploader !== this.myPubkey) {
+    if (this.normalizePubkey(fileItem.uploader) !== this.normalizePubkey(this.myPubkey)) {
       this.folderFiles = this.folderFiles.filter((item) => item.blobHash !== fileItem.blobHash);
       this.status = `Removed ${fileItem.fileName} from your list.`;
       return;
@@ -755,7 +912,9 @@ export class DriveForm extends LitElement {
     try {
       this.error = "";
       this.status = `Deleting ${fileItem.fileName}...`;
-      await deleteFile(fileItem.blobHash);
+      await deleteFile(fileItem.blobHash, {
+        ownerPubkey: this.selectedFolder?.ownerPubkey || this.myPubkey,
+      });
       await this.selectFolder(this.selectedFolder);
       await this.refreshSidebarData();
       this.status = `Deleted ${fileItem.fileName}.`;

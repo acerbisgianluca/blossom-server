@@ -1,4 +1,4 @@
-import { RELAYS } from "./config.js";
+import { EVENT_KINDS, RELAYS } from "./config.js";
 import {
   fetchFolder,
   getFolderAddress,
@@ -25,7 +25,7 @@ function normalizePubkey(pubkey) {
 
 function parseFolderAddress(address) {
   const parts = (address || "").split(":");
-  if (parts.length !== 3 || parts[0] !== "30000") return null;
+  if (parts.length !== 3 || parts[0] !== EVENT_KINDS.FOLDER.toString()) return null;
   return {
     ownerPubkey: normalizePubkey(parts[1]),
     folderId: parts[2],
@@ -174,7 +174,7 @@ export async function unlockFolderWithZap(folderId, ownerPubkey) {
     throw new Error("Folder not found");
   }
 
-  const priceMsats = ensureAmountMsats(getTagValue(folderEvent, "price"));
+  const priceMsats = ensureAmountMsats(getTagValue(folderEvent, "amount") || getTagValue(folderEvent, "price"));
   const { callback, lnurl } = await resolveZapEndpoint(folderEvent);
   const { event: zapRequest } = await buildZapRequest(folderEvent, priceMsats);
   const invoice = await requestInvoice(callback, lnurl, zapRequest, priceMsats);
@@ -229,7 +229,7 @@ async function verifyReceiptAndExtractGrant(receiptEvent, ownerPubkey) {
   const folderEvent = await fetchFolder(parsedAddress.ownerPubkey, parsedAddress.folderId);
   if (!folderEvent) return null;
 
-  const priceMsats = ensureAmountMsats(getTagValue(folderEvent, "price"));
+  const priceMsats = ensureAmountMsats(getTagValue(folderEvent, "amount") || getTagValue(folderEvent, "price"));
   if (receiptAmountMsats < priceMsats) return null;
 
   const payerPubkey = normalizePubkey(zapRequest.pubkey);

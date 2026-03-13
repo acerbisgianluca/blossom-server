@@ -65,6 +65,7 @@ async function buildRecipientEntries(folderKey, recipients) {
 }
 
 function extractMetadataPayload(metadataEvent) {
+  const folderRef = getTagValue(metadataEvent, "a") || getTagValue(metadataEvent, "folder");
   return {
     blobHash: getTagValue(metadataEvent, "x"),
     blobUrl: getTagValue(metadataEvent, "url"),
@@ -73,7 +74,7 @@ function extractMetadataPayload(metadataEvent) {
     fileSize: Number.parseInt(getTagValue(metadataEvent, "size") || "0", 10),
     fileName: getTagValue(metadataEvent, "name") || undefined,
     fileId: getTagValue(metadataEvent, "file_id") || undefined,
-    folderId: getFolderIdFromRef(getTagValue(metadataEvent, "folder")) || undefined,
+    folderId: getFolderIdFromRef(folderRef) || undefined,
   };
 }
 

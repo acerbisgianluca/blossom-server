@@ -8,6 +8,14 @@ import { unixNow } from "../utils.js";
 let pool = null;
 let lastPublishedCreatedAt = 0;
 
+function getFolderKinds() {
+  return [EVENT_KINDS.FOLDER];
+}
+
+function getShareKinds() {
+  return [EVENT_KINDS.SHARE];
+}
+
 function nextCreatedAt(proposedCreatedAt = unixNow()) {
   const nextValue = Math.max(proposedCreatedAt, lastPublishedCreatedAt + 1);
   lastPublishedCreatedAt = nextValue;
@@ -109,6 +117,7 @@ export async function publishFolderEvent(folderId, folderName, options = {}) {
   ];
 
   if (price != null && Number.isFinite(Number(price)) && Number(price) > 0) {
+    tags.push(["amount", String(Math.trunc(Number(price)))]);
     tags.push(["price", String(Math.trunc(Number(price)))]);
   }
 
@@ -154,6 +163,7 @@ export async function publishFileMetadata(metadata) {
     ["url", blobUrl],
     ["m", mimeType],
     ["size", fileSize.toString()],
+    ["a", folderRef],
     ["folder", folderRef],
     ["wrapped_fdk", wrappedFDK],
     ["enc", "aes-256-gcm"],
@@ -273,7 +283,7 @@ export async function publishShareEvent(shareData) {
 export async function fetchUserFolders(pubkey) {
   const normalizedPubkey = normalizePubkey(pubkey);
   const events = await fetchEvents({
-    kinds: [EVENT_KINDS.FOLDER],
+    kinds: getFolderKinds(),
     authors: [normalizedPubkey],
     limit: 200,
   });
@@ -294,14 +304,14 @@ export async function fetchUserFolders(pubkey) {
 
 export async function fetchPaidFolders(limit = 300) {
   const events = await fetchEvents({
-    kinds: [EVENT_KINDS.FOLDER],
+    kinds: getFolderKinds(),
     limit,
   });
 
   const latestByFolderAddress = new Map();
   for (const event of events) {
     const folderId = getTagValue(event, "d");
-    const price = getTagValue(event, "price");
+    const price = getTagValue(event, "amount") || getTagValue(event, "price");
     if (!folderId || !price) continue;
 
     const folderAddress = getFolderAddress(event.pubkey, folderId);
@@ -326,7 +336,7 @@ export async function fetchFilesInFolder(ownerPubkey, folderId) {
   const latestByFileIdentity = new Map();
 
   for (const event of events) {
-    const folderRef = getTagValue(event, "folder");
+    const folderRef = getTagValue(event, "a") || getTagValue(event, "folder");
     const rawFolderId = getFolderIdFromRef(folderRef);
     if (folderRef !== addressableRef && rawFolderId !== folderId) {
       continue;
@@ -341,7 +351,7 @@ export async function fetchFilesInFolder(ownerPubkey, folderId) {
 
   return [...latestByFileIdentity.values()]
     .filter((event) => {
-      const folderRef = getTagValue(event, "folder");
+      const folderRef = getTagValue(event, "a") || getTagValue(event, "folder");
       const rawFolderId = getFolderIdFromRef(folderRef);
       return folderRef === addressableRef || rawFolderId === folderId;
     })
@@ -365,7 +375,7 @@ export async function fetchFolderShares({ recipientPubkey = null, folderId = nul
   }
 
   const filter = {
-    kinds: [EVENT_KINDS.SHARE],
+    kinds: getShareKinds(),
     limit: 500,
   };
 
@@ -392,7 +402,7 @@ export async function fetchLatestFolderShare(folderId, ownerPubkey = null, recip
 export async function fetchFolder(pubkey, folderId) {
   const normalizedPubkey = normalizePubkey(pubkey);
   const events = await fetchEvents({
-    kinds: [EVENT_KINDS.FOLDER],
+    kinds: getFolderKinds(),
     authors: [normalizedPubkey],
     "#d": [folderId],
     limit: 50,
@@ -491,14 +501,14 @@ export function subscribeToFolderSharesForRecipient(recipientPubkey, handlers = 
     RELAYS,
     [
       {
-        kinds: [EVENT_KINDS.SHARE],
+        kinds: getShareKinds(),
         "#p": [normalizedPubkey],
         since: unixNow() - sinceSecondsAgo,
       },
     ],
     {
       onevent: (shareEvent) => {
-        if (shareEvent.kind !== EVENT_KINDS.SHARE) return;
+        if (!getShareKinds().includes(shareEvent.kind)) return;
         if (seenEventIds.has(shareEvent.id)) return;
         seenEventIds.add(shareEvent.id);
         onEvent?.(shareEvent);
@@ -556,7 +566,9 @@ export function buildFolderAddress(folderEvent) {
 function parseFolderAddress(folderAddress) {
   const parts = (folderAddress || "").split(":");
   if (parts.length !== 3) return null;
-  if (parts[0] !== String(EVENT_KINDS.FOLDER)) return null;
+  const folderKind = String(parts[0]);
+  const validKinds = new Set(getFolderKinds().map((kind) => String(kind)));
+  if (!validKinds.has(folderKind)) return null;
   return {
     ownerPubkey: normalizePubkey(parts[1]),
     folderId: parts[2],
@@ -692,7 +704,7 @@ export async function fetchShareEventsForFolder(folderAddress) {
 
   const { ownerPubkey, folderId } = parsedAddress;
   let events = await fetchEvents({
-    kinds: [EVENT_KINDS.SHARE],
+    kinds: getShareKinds(),
     "#a": [folderAddress],
     authors: [ownerPubkey],
     limit: 500,
@@ -701,7 +713,7 @@ export async function fetchShareEventsForFolder(folderAddress) {
   // Relays may miss #a indexing; fallback to author-scan and local filtering.
   if (!events.length) {
     const scanned = await fetchEvents({
-      kinds: [EVENT_KINDS.SHARE],
+      kinds: getShareKinds(),
       authors: [ownerPubkey],
       limit: 500,
     });
@@ -723,7 +735,7 @@ export async function fetchShareEventsForFolder(folderAddress) {
 
   if (legacyEvents.length > 0) {
     events = await fetchEvents({
-      kinds: [EVENT_KINDS.SHARE],
+      kinds: getShareKinds(),
       "#a": [folderAddress],
       authors: [ownerPubkey],
       limit: 500,
@@ -731,18 +743,26 @@ export async function fetchShareEventsForFolder(folderAddress) {
 
     if (!events.length) {
       const scanned = await fetchEvents({
-        kinds: [EVENT_KINDS.SHARE],
+        kinds: getShareKinds(),
         authors: [ownerPubkey],
         limit: 500,
       });
-      events = scanned.filter((event) => getTagValue(event, "a") === folderAddress);
+      events = scanned.filter((event) => {
+        const eventAddress = parseFolderAddress(getTagValue(event, "a"));
+        return !!eventAddress && eventAddress.ownerPubkey === ownerPubkey && eventAddress.folderId === folderId;
+      });
     }
   }
 
   const canonical = events.filter((event) => {
     const recipient = getTagValue(event, "p");
     const encryptedKey = getTagValue(event, "key");
-    return getTagValue(event, "a") === folderAddress && recipient && encryptedKey;
+    const parsedEventAddress = parseFolderAddress(getTagValue(event, "a"));
+    return !!parsedEventAddress
+      && parsedEventAddress.ownerPubkey === ownerPubkey
+      && parsedEventAddress.folderId === folderId
+      && recipient
+      && encryptedKey;
   });
 
   return dedupeShareEvents(canonical);
@@ -752,7 +772,7 @@ export async function fetchShareEventsForUser(pubkey) {
   const normalizedPubkey = normalizePubkey(pubkey);
   const myPubkey = normalizePubkey(await window.nostr.getPublicKey());
   const events = await fetchEvents({
-    kinds: [EVENT_KINDS.SHARE],
+    kinds: getShareKinds(),
     "#p": [normalizedPubkey],
     limit: 500,
   });
@@ -768,7 +788,7 @@ export async function fetchShareEventsForUser(pubkey) {
   let latest = events;
   if (legacyEvents.length > 0) {
     latest = await fetchEvents({
-      kinds: [EVENT_KINDS.SHARE],
+      kinds: getShareKinds(),
       "#p": [normalizedPubkey],
       limit: 500,
     });
@@ -793,7 +813,8 @@ export function getFolderAddress(pubkey, folderId) {
 export function getFolderIdFromRef(folderRef) {
   if (!folderRef) return null;
   const parts = folderRef.split(":");
-  if (parts.length === 3 && parts[0] === String(EVENT_KINDS.FOLDER)) {
+  const validKinds = new Set(getFolderKinds().map((kind) => String(kind)));
+  if (parts.length === 3 && validKinds.has(parts[0])) {
     return parts[2];
   }
   return folderRef;

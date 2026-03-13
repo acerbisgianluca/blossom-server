@@ -20,7 +20,7 @@
 
 /**
  * @typedef {Object} ShareEventPayload
- * @property {string} folderAddress - Nostr a-tag value (30000:<owner_pubkey>:<folder_id>)
+ * @property {string} folderAddress - Nostr a-tag value (<folder_kind>:<owner_pubkey>:<folder_id>)
  * @property {string} recipientPubkey - Recipient pubkey for this grant
  * @property {string} encryptedFAK - NIP-44 encrypted folder access key for recipient
  * @property {string} senderPubkey - Nostr pubkey of owner/sender

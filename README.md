@@ -134,3 +134,10 @@ The drive UI is now folder-centric.
 - **Folder-level encryption** — folders themselves are not encrypted; file-only encryption supported in v1
 - **Browser-only** — no Node.js/CLI support in v1
 - **Forward-only revocation** — revoked users may retain access to data they already obtained
+- **Zap provider compatibility (WIP)** — zap-gated unlock currently depends on Lightning address/LNURL provider behavior and may fail with some providers
+
+### Work In Progress / Future Development
+
+- Improve zap-gated folder unlock reliability across more Lightning providers
+- Add broader LNURL format handling and provider-specific fallbacks
+- Improve payment error diagnostics and recovery UX

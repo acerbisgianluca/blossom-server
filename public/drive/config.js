@@ -22,7 +22,8 @@ export function getBlossomUrl() {
 }
 
 export const EVENT_KINDS = {
-  FOLDER: 30000,        // Parameterized replaceable folder definition
+  // Custom parameterized replaceable kinds for this app (avoid NIP-reserved 30000/30001).
+  FOLDER: 33100,
   FILE_METADATA: 1063,  // NIP-94 media event
-  SHARE: 30001,         // Parameterized replaceable share event per recipient
+  SHARE: 33101,
 };

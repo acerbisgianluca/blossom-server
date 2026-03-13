@@ -56,7 +56,8 @@ export async function deleteFile(blobHash) {
     return { deleted: false, reason: "not-owner" };
   }
 
-  const folderId = getFolderIdFromRef(getTagValue(metadataEvent, "folder"));
+  const folderRef = getTagValue(metadataEvent, "a") || getTagValue(metadataEvent, "folder");
+  const folderId = getFolderIdFromRef(folderRef);
   const fileId = getTagValue(metadataEvent, "file_id");
   const relatedShares = folderId
     ? (await fetchFolderShareEvents(folderId, myPubkey)).filter((event) =>

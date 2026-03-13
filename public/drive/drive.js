@@ -10,7 +10,7 @@ import {
   wrapKey,
 } from "./encryption.js";
 import { downloadBlob, uploadBlob } from "./blossom.js";
-import { getBlossomUrl } from "./config.js";
+import { EVENT_KINDS, getBlossomUrl } from "./config.js";
 import { newExpirationValue, unixNow } from "../utils.js";
 import { deleteFile as deleteFileRecord, deleteFolder as deleteFolderRecord } from "./deletion.js";
 import {
@@ -52,7 +52,7 @@ function normalizePubkey(pubkey) {
 function parseFolderAddress(address) {
   const parts = (address || "").split(":");
   if (parts.length !== 3) return null;
-  if (parts[0] !== "30000") return null;
+  if (parts[0] !== EVENT_KINDS.FOLDER.toString()) return null;
   return {
     ownerPubkey: parts[1],
     folderId: parts[2],
@@ -95,20 +95,21 @@ function buildAutoFolderName(files) {
 }
 
 function mapFileEvent(event) {
+  const folderRef = getTagValue(event, "a") || getTagValue(event, "folder");
   return {
     blobHash: getTagValue(event, "x"),
     blobUrl: getTagValue(event, "url"),
     fileName: getTagValue(event, "name") || `file-${(getTagValue(event, "x") || "blob").slice(0, 10)}`,
     mimeType: getTagValue(event, "m") || "application/octet-stream",
     size: Number.parseInt(getTagValue(event, "size") || "0", 10),
-    folderId: getFolderIdFromRef(getTagValue(event, "folder")),
+    folderId: getFolderIdFromRef(folderRef),
     uploadedAt: event.created_at,
     uploader: event.pubkey,
   };
 }
 
 function isPaidFolder(folderEvent) {
-  const price = Number.parseInt(getTagValue(folderEvent, "price") || "0", 10);
+  const price = Number.parseInt(getTagValue(folderEvent, "amount") || getTagValue(folderEvent, "price") || "0", 10);
   return Number.isFinite(price) && price > 0;
 }
 
@@ -120,7 +121,7 @@ async function enrichFolderEvent(folderEvent) {
     folderName: getTagValue(folderEvent, "name") || folderId,
     ownerPubkey: folderEvent.pubkey,
     createdAt: folderEvent.created_at,
-    priceMsats: Number.parseInt(getTagValue(folderEvent, "price") || "0", 10) || null,
+    priceMsats: Number.parseInt(getTagValue(folderEvent, "amount") || getTagValue(folderEvent, "price") || "0", 10) || null,
     zapTarget: getTagValue(folderEvent, "zap") || null,
     fileCount: files.length,
   };
@@ -225,7 +226,8 @@ export async function downloadFile(blobHash, onProgress = () => {}) {
   }
 
   const wrappedFDK = getTagValue(metadataEvent, "wrapped_fdk");
-  const folderId = getFolderIdFromRef(getTagValue(metadataEvent, "folder"));
+  const folderRef = getTagValue(metadataEvent, "a") || getTagValue(metadataEvent, "folder");
+  const folderId = getFolderIdFromRef(folderRef);
   if (!wrappedFDK || !folderId) {
     throw new Error("Metadata missing folder or wrapped_fdk tag");
   }
@@ -302,7 +304,7 @@ export async function listSharedWithMe() {
           folderName: (folderEvent && getTagValue(folderEvent, "name")) || folderId,
           ownerPubkey,
           sharedAt: shareEvent.created_at,
-          priceMsats: Number.parseInt(getTagValue(folderEvent || shareEvent, "price") || "0", 10) || null,
+          priceMsats: Number.parseInt(getTagValue(folderEvent || shareEvent, "amount") || getTagValue(folderEvent || shareEvent, "price") || "0", 10) || null,
           zapTarget: getTagValue(folderEvent || shareEvent, "zap") || null,
           fileCount: files.length,
         };
@@ -355,7 +357,7 @@ export async function listLockedFolders() {
       ownerPubkey,
       createdAt: folderEvent.created_at,
       fileCount: 0,
-      priceMsats: Number.parseInt(getTagValue(folderEvent, "price") || "0", 10) || null,
+      priceMsats: Number.parseInt(getTagValue(folderEvent, "amount") || getTagValue(folderEvent, "price") || "0", 10) || null,
       zapTarget: getTagValue(folderEvent, "zap") || null,
       locked: true,
       source: "locked",

@@ -99,6 +99,24 @@ export async function deleteBlob(hash) {
   const blossomUrl = getBlossomUrl();
   const url = `${blossomUrl}/${hash}`;
 
-  const res = await fetch(url, { method: "DELETE" });
+  const auth = await window.nostr.signEvent({
+    kind: 24242,
+    content: "Authorize Delete",
+    created_at: unixNow(),
+    tags: [
+      ["t", "delete"],
+      ["x", hash],
+      ["expiration", newExpirationValue()],
+    ],
+  });
+
+  const authorization = "Nostr " + btoa(JSON.stringify(auth));
+
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: {
+      "authorization": authorization,
+    },
+  });
   return res.ok;
 }

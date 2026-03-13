@@ -667,18 +667,27 @@ export class DriveForm extends LitElement {
   }
 
   async deleteSelectedFolder() {
-    if (!this.selectedFolder) return;
-    if (this.selectedFolder.ownerPubkey !== this.myPubkey) return;
+    await this.deleteFolderItem(this.selectedFolder);
+  }
 
-    const confirmed = window.confirm("Delete this folder and all files inside?");
+  async deleteFolderItem(folder) {
+    if (!folder) return;
+    if (folder.ownerPubkey !== this.myPubkey) return;
+
+    const confirmed = window.confirm(`Delete ${folder.folderName} and all files inside?`);
     if (!confirmed) return;
 
     try {
       this.error = "";
-      this.status = `Deleting ${this.selectedFolder.folderName}...`;
-      await deleteFolder(this.selectedFolder.folderId);
-      this.selectedFolder = null;
-      this.folderFiles = [];
+      this.status = `Deleting ${folder.folderName}...`;
+      await deleteFolder(folder.folderId);
+      if (this.selectedFolder
+        && this.selectedFolder.folderId === folder.folderId
+        && this.selectedFolder.ownerPubkey === folder.ownerPubkey
+      ) {
+        this.selectedFolder = null;
+        this.folderFiles = [];
+      }
       await this.refreshSidebarData();
       this.status = "Folder deleted.";
     } catch (error) {
@@ -822,18 +831,36 @@ export class DriveForm extends LitElement {
     return html`
       <div class="space-y-0.5">
         ${folders.map(
-          (folder) => html`<button
-            type="button"
-            @click="${() => this.selectFolder(folder)}"
-            class="w-full rounded-lg px-3 py-2.5 text-left transition ${this.selectedFolder
-              && this.selectedFolder.folderId === folder.folderId
-              && this.selectedFolder.ownerPubkey === folder.ownerPubkey
-              ? "bg-green-950/60 ring-1 ring-green-600"
-              : "hover:bg-green-950/40"}"
-          >
-            <div class="truncate text-sm font-medium text-green-300">${folder.folderName}</div>
-            <div class="mt-0.5 text-xs text-green-700">${folder.fileCount} file${folder.fileCount === 1 ? "" : "s"}</div>
-          </button>`,
+          (folder) => {
+            const isOwnedFolder = folder.ownerPubkey === this.myPubkey;
+            return html`<div class="flex items-center gap-2">
+              <button
+                type="button"
+                @click="${() => this.selectFolder(folder)}"
+                class="flex-1 rounded-lg px-3 py-2.5 text-left transition ${this.selectedFolder
+                  && this.selectedFolder.folderId === folder.folderId
+                  && this.selectedFolder.ownerPubkey === folder.ownerPubkey
+                  ? "bg-green-950/60 ring-1 ring-green-600"
+                  : "hover:bg-green-950/40"}"
+              >
+                <div class="truncate text-sm font-medium text-green-300">${folder.folderName}</div>
+                <div class="mt-0.5 text-xs text-green-700">${folder.fileCount} file${folder.fileCount === 1 ? "" : "s"}</div>
+              </button>
+              ${isOwnedFolder
+                ? html`<button
+                    type="button"
+                    @click="${(event) => {
+                      event.stopPropagation();
+                      this.deleteFolderItem(folder);
+                    }}"
+                    class="rounded-full border border-red-700 px-2 py-1 text-xs text-red-300 hover:bg-red-950"
+                    title="Delete folder"
+                  >
+                    🗑
+                  </button>`
+                : null}
+            </div>`;
+          },
         )}
       </div>
     `;
@@ -1098,15 +1125,6 @@ export class DriveForm extends LitElement {
                   class="rounded-md border border-green-700 px-3 py-2 text-sm text-green-300 hover:bg-green-950"
                 >
                   ⬇ Download All
-                </button>`
-              : null}
-            ${isOwnedFolder
-              ? html`<button
-                  type="button"
-                  @click="${() => this.deleteSelectedFolder()}"
-                  class="rounded-md border border-red-700 px-3 py-2 text-sm text-red-300 hover:bg-red-950"
-                >
-                  Delete Folder
                 </button>`
               : null}
           </div>

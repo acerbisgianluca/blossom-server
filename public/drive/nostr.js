@@ -464,18 +464,6 @@ export function getFolderIdFromRef(folderRef) {
   return folderRef;
 }
 
-function hexToBytes(hex) {
-  if (typeof hex !== "string" || hex.length % 2 !== 0) {
-    throw new Error("Invalid hex string");
-  }
-
-  const bytes = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2) {
-    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  }
-  return bytes;
-}
-
 function normalizePubkey(pubkey) {
   if (pubkey?.startsWith("npub")) {
     const decoded = window.NostrTools?.nip19?.decode(pubkey);
@@ -486,21 +474,6 @@ function normalizePubkey(pubkey) {
   }
 
   return pubkey;
-}
-
-function getLocalPrivateKeyBytes() {
-  const nsec = window.localStorage.getItem("driveNsec");
-  if (nsec?.startsWith("nsec")) {
-    const decoded = window.NostrTools?.nip19?.decode(nsec);
-    if (decoded?.type === "nsec") return decoded.data;
-  }
-
-  const hex = window.localStorage.getItem("drivePrivkeyHex");
-  if (hex && /^[0-9a-f]{64}$/i.test(hex)) {
-    return hexToBytes(hex.toLowerCase());
-  }
-
-  return null;
 }
 
 export async function encryptNIP44(plaintext, recipientPubkey) {
@@ -514,20 +487,7 @@ export async function encryptNIP44(plaintext, recipientPubkey) {
     return window.nostr.nip44.encryptAsync(targetPubkey, plaintext);
   }
 
-  const nip44 = window.NostrTools?.nip44;
-  if (nip44?.v2?.utils?.getConversationKey && nip44?.v2?.encrypt) {
-    const privateKey = getLocalPrivateKeyBytes();
-    if (!privateKey) {
-      throw new Error(
-        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback.",
-      );
-    }
-
-    const conversationKey = nip44.v2.utils.getConversationKey(privateKey, targetPubkey);
-    return nip44.v2.encrypt(plaintext, conversationKey);
-  }
-
-  throw new Error("NIP-44 encryption unavailable: extension and nostr-tools fallback are both unavailable");
+  throw new Error("NIP-44 encryption unavailable: window.nostr does not expose nip44 support");
 }
 
 export async function decryptNIP44(ciphertext, senderPubkey) {
@@ -541,18 +501,5 @@ export async function decryptNIP44(ciphertext, senderPubkey) {
     return window.nostr.nip44.decryptAsync(sourcePubkey, ciphertext);
   }
 
-  const nip44 = window.NostrTools?.nip44;
-  if (nip44?.v2?.utils?.getConversationKey && nip44?.v2?.decrypt) {
-    const privateKey = getLocalPrivateKeyBytes();
-    if (!privateKey) {
-      throw new Error(
-        "NIP-44 unavailable in extension. Set localStorage driveNsec or drivePrivkeyHex for nostr-tools fallback.",
-      );
-    }
-
-    const conversationKey = nip44.v2.utils.getConversationKey(privateKey, sourcePubkey);
-    return nip44.v2.decrypt(ciphertext, conversationKey);
-  }
-
-  throw new Error("NIP-44 decryption unavailable: extension and nostr-tools fallback are both unavailable");
+  throw new Error("NIP-44 decryption unavailable: window.nostr does not expose nip44 support");
 }

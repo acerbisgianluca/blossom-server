@@ -50,54 +50,59 @@ Recipients decrypt the folder key once and then use it to unwrap each file's FDK
 - **Kind 30001 (Folder Share)** — parameterized replaceable share event per folder
   Tags: `[["d", "<folder_id>"], ["folder", "<folder_id>"]]`, repeated `[["p", "<recipient_pubkey>"]]`, repeated `[["access_key", "<recipient_pubkey>", "<nip44_encrypted_folder_key>"]]`
 
-### Upload Flow
+### Upload Flow (Detailed)
 
 ```text
-create or select folder
-generate FAK_folder if folder is new
-
-for each file:
-  generate FDK
-  encrypt file with FDK
-  wrap FDK with FAK_folder
-  upload encrypted blob to Blossom
-  publish file metadata event with folder_id + wrapped_fdk
+1. Create or select a folder.
+2. If the folder is new, generate a random 32-byte `FAK_folder`.
+3. Build the folder share event:
+  - For each recipient, encrypt `FAK_folder` using NIP-44.
+  - Publish Kind 30001 with `p` tags and `access_key` tags for each recipient.
+4. For each file:
+  - Generate a random 32-byte `FDK`.
+  - Encrypt the plaintext file with `FDK` using AES-256-GCM.
+  - Wrap the `FDK` with `FAK_folder` using AES-256-GCM, producing `wrapped_fdk`.
+  - Upload the encrypted blob to Blossom.
+  - Publish Kind 1063 metadata with `folder` and `wrapped_fdk` tags.
 ```
 
 If no owned folder is selected, the UI automatically creates a folder named after the upload batch.
 
-### Download Flow
+### Download Flow (Detailed)
 
 ```text
-fetch file metadata
-read folder_id and wrapped_fdk
-fetch folder share event for current user
-decrypt FAK_folder with NIP-44
-unwrap FDK
-download encrypted blob from Blossom
-decrypt file locally
+1. Fetch the latest file metadata event for the blob hash.
+2. Read `folder_id` and `wrapped_fdk` tags from metadata.
+3. Fetch the latest folder share event for the folder owner.
+4. Decrypt `FAK_folder` using NIP-44 with the current user's key.
+5. Unwrap the `FDK` by decrypting `wrapped_fdk` using `FAK_folder`.
+6. Download the encrypted blob from Blossom.
+7. Decrypt the blob locally using `FDK`.
 ```
 
-### Rotation And Revocation
+### Rotation And Revocation (Detailed)
 
-Revocation and rotation now happen at the folder level.
+Revocation and rotation happen at the folder level and do not reupload blobs.
 
-When revoking a user or rotating a folder key:
+When rotating or revoking:
 
-1. Fetch all files in the folder
-2. Decrypt each file's wrapped FDK using the current folder key
-3. Generate a new folder key
-4. Rewrap every FDK with the new folder key
-5. Publish fresh file metadata events with updated `wrapped_fdk`
-6. Publish a new folder share event for the remaining recipients
+```text
+1. Fetch all file metadata events for the folder.
+2. For each file:
+  - Decrypt `wrapped_fdk` using the current `FAK_folder`.
+  - Generate a new `FAK_folder` (rotation) or reuse a newly generated one (revocation).
+  - Rewrap each `FDK` with the new `FAK_folder`.
+  - Publish a new file metadata event with updated `wrapped_fdk`.
+3. Publish a new folder share event with NIP-44 encrypted `FAK_folder` for the remaining recipients.
+```
 
-Encrypted blobs are never reuploaded during rotation or revocation.
+> Note: revocation is forward-only. Recipients who previously had the old folder key can still decrypt any data they already downloaded.
 
 ### Browser UI
 
 The drive UI is now folder-centric.
 
-1. Navigate to `http://localhost:3000/#drive`
+1. Navigate to `http://localhost:3000/#upload`
 2. Connect a Nostr extension (e.g. nos2x, Alby, any NIP-07 compatible signer)
 3. Use the left sidebar to browse:
    - **Folders** — folders you own
@@ -109,6 +114,7 @@ The drive UI is now folder-centric.
    - share or revoke folder access
    - rotate folder keys
    - browse and download files in the selected folder
+5. Use the trash icon on a folder card in the sidebar to delete an owned folder.
 
 ### Dependencies
 
@@ -127,4 +133,4 @@ The drive UI is now folder-centric.
 
 - **Folder-level encryption** — folders themselves are not encrypted; file-only encryption supported in v1
 - **Browser-only** — no Node.js/CLI support in v1
-- **No key rotation** — once encrypted, file keys cannot be rotated without re-uploading
+- **Forward-only revocation** — revoked users may retain access to data they already obtained
